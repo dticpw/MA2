@@ -3,16 +3,20 @@
 第二步的核心约束：**worktree 串行创建，Agent 并行执行。**
 
 `git worktree add` 会写目标仓库的 refs 和 index，并发调用必然撞 index.lock。
-所以执行分三个阶段：
+所以执行分四个阶段：
 
-    1. prepare   串行。逐个建工作区，任何一个失败就整体中止，不留半拉子现场。
-    2. dispatch  并行。ThreadPoolExecutor，每个 Agent 一个线程。
-                 Agent 是 I/O 密集（阻塞在子进程管道上），线程模型足够。
-    3. collect   串行。收集 worktree 改动，写聚合状态，按需回收。
+    1. prepare    串行。逐个建工作区，任何一个失败就整体中止，不留半拉子现场。
+    2. dispatch   并行。ThreadPoolExecutor，每个 Agent 一个线程。
+                  Agent 是 I/O 密集（阻塞在子进程管道上），线程模型足够。
+    3. collect    串行。提交改动到各自分支，收集 diff，写聚合状态，按需回收。
+    4. aggregate  串行。N 份 result.json → final.md。
 
 第三步加入的是**判定与重试**（见 ma2.policy）：dispatch 里每个 Agent 跑的不再是
 一次 run_agent，而是"跑 → 判定 → 该重试就重置工作区再跑"的循环。汇总口径也
 随之从 status 改成 verdict。
+
+第四步加入的是**汇总**（见 ma2.aggregate）。它必须排在 collect 之后，因为产出
+要先被提交到分支上才读得到 —— 阶段 4 只从分支读，不碰工作目录。
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from . import aggregate as AG
 from . import policy as PO
 from . import protocol as P
 from . import workspace as W
@@ -33,7 +38,7 @@ class Orchestrator:
     def __init__(self, plan: dict[str, Any], paths: P.RunPaths, *,
                  max_parallel: int = 3, forward_anthropic: bool = False,
                  quiet: bool = False, cleanup: bool = False,
-                 autocommit: bool = True):
+                 autocommit: bool = True, aggregate_with_agent: bool | None = None):
         self.plan = plan
         self.paths = paths
         self.tasks: list[dict[str, Any]] = plan.get("tasks") or []
@@ -42,6 +47,12 @@ class Orchestrator:
         self.quiet = quiet
         self.cleanup = cleanup
         self.autocommit = autocommit
+        # 综合层要花钱，因此显式开启：plan 里给了 aggregator，或命令行 --aggregate。
+        # 机械层不受这个开关影响，永远产出。
+        self.aggregate_with_agent = (
+            bool(plan.get("aggregator")) if aggregate_with_agent is None
+            else aggregate_with_agent
+        )
 
         self.workspaces: dict[str, W.Workspace] = {}
         self.results: dict[str, dict[str, Any]] = {}
@@ -70,7 +81,7 @@ class Orchestrator:
         if self.plan.get("repo") and "repo" not in defaults:
             defaults["repo"] = self.plan["repo"]
 
-        self.note(f"阶段 1/3  准备 {len(self.tasks)} 个工作区（串行）")
+        self.note(f"阶段 1/4  准备 {len(self.tasks)} 个工作区（串行）")
         for task in self.tasks:
             agent_id = task["id"]
             spec = W.resolve_spec(task, defaults)
@@ -95,7 +106,7 @@ class Orchestrator:
     # ------------------------------------------------------- 阶段 2：并行派发
     def dispatch(self) -> None:
         n = len(self.tasks)
-        self.note(f"\n阶段 2/3  并行派发 {n} 个 Agent（max_parallel={self.max_parallel}）")
+        self.note(f"\n阶段 2/4  并行派发 {n} 个 Agent（max_parallel={self.max_parallel}）")
 
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             futures = {pool.submit(self.run_with_retry, t): t["id"] for t in self.tasks}
@@ -201,7 +212,7 @@ class Orchestrator:
 
     # ------------------------------------------------------- 阶段 3：串行收尾
     def collect(self) -> dict[str, Any]:
-        self.note("\n阶段 3/3  收集改动")
+        self.note("\n阶段 3/4  收集改动")
         for task in self.tasks:
             agent_id = task["id"]
             ws = self.workspaces.get(agent_id)
@@ -281,8 +292,86 @@ class Orchestrator:
         })
         return summary
 
+    # ------------------------------------------------------- 阶段 4：串行汇总
+    def aggregate(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """把 N 份 result.json 汇总成 final.md。
+
+        必须排在 collect 之后：产出要先被提交到分支上，这里才读得到
+        （结论 7）。也正因为读的是分支，`--cleanup` 把工作区收掉之后汇总
+        照样成立。
+
+        机械层无条件产出，综合层显式开启 —— 见 ma2.aggregate 的模块说明。
+        """
+        ordered = [self.results[t["id"]] for t in self.tasks if t["id"] in self.results]
+        self.note("\n阶段 4/4  汇总")
+        records = AG.gather(ordered, self.tasks)
+        brief = AG.build_brief(self.paths.run_id, self.plan.get("run_name"), records)
+        self.paths.brief.write_text(brief, encoding="utf-8")
+
+        synthesis: dict[str, Any] | None = None
+        if self.aggregate_with_agent:
+            synthesis = self.run_aggregator(brief)
+            # 汇总器不算进 ok/total —— 它不是参与运算的 Agent，算进去会把
+            # "3/3 成功"写成"3/4"。但它**确实花了钱**：费用不并进总额，
+            # 打出来的总价就比实际少一个 Agent，那还是账面比现实好看。
+            # 两个口径都留着：agents_cost_usd 是干活的部分，total 是这次
+            # run 真实的开销。
+            cost = synthesis.get("cost_usd")
+            summary["agents_cost_usd"] = summary.get("total_cost_usd")
+            summary["aggregator_cost_usd"] = cost
+            summary["total_cost_usd"] = (summary.get("total_cost_usd") or 0.0) + (cost or 0.0)
+            if not synthesis.get("cost_is_complete", True):
+                # 汇总器超时/崩溃时费用无从得知，按 0 计入，总额就此变成下界
+                summary["cost_is_complete"] = False
+
+        self.paths.final.write_text(
+            AG.render_final(self.paths.run_id, self.plan.get("run_name"),
+                            summary, records, synthesis),
+            encoding="utf-8",
+        )
+        self.note(f"\n汇总   {self.paths.final}")
+        summary["final"] = str(self.paths.final)
+        summary["brief"] = str(self.paths.brief)
+        if synthesis is not None:
+            summary["aggregator"] = synthesis
+        P.write_atomic(self.paths.run_json, {
+            **(P.read_json(self.paths.run_json) or {}), **summary,
+        })
+        return summary
+
+    def run_aggregator(self, brief: str) -> dict[str, Any]:
+        """跑综合层。它就是一个普通 Agent：同一套超时、判定与重试。
+
+        失败不抛异常 —— 综合失败只该让 final.md 少一段正文，不该让整次 run
+        的收尾崩掉。各 Agent 的产出已经在各自分支上了。
+        """
+        task = AG.aggregator_task(self.plan, brief)
+        agent_id = task["id"]
+        dest = self.paths.workspace(agent_id)
+        dest.mkdir(parents=True, exist_ok=True)
+        self.workspaces[agent_id] = W.Workspace(agent_id, W.PLAIN, dest)
+        self.note(f"\n阶段 4/4  综合汇总（{agent_id}）")
+        try:
+            result = self.run_with_retry(task)
+        except Exception as exc:  # 总结器崩了不能拖垮收尾
+            self.log(agent_id, f"执行器异常: {exc!r}")
+            return {"ok": False, "reasons": [PO.CRASHED], "status": P.FAILED,
+                    "attempt": 0, "answer": None, "error": repr(exc),
+                    "cost_usd": 0.0, "cost_is_complete": False}
+        verdict = result.get("verdict") or {}
+        metrics = result.get("metrics") or {}
+        return {
+            "ok": bool(verdict.get("ok")),
+            "reasons": verdict.get("reasons") or [],
+            "status": result.get("status"),
+            "attempt": result.get("attempt"),
+            "answer": result.get("answer"),
+            "cost_usd": metrics.get("cost_all_attempts_usd"),
+            "cost_is_complete": metrics.get("cost_is_complete", True),
+        }
+
     # ------------------------------------------------------------------ 总入口
     def execute(self) -> dict[str, Any]:
         self.prepare()
         self.dispatch()
-        return self.collect()
+        return self.aggregate(self.collect())

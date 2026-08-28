@@ -41,12 +41,16 @@ class Workspace:
     head: str | None = None
 
 
-def _git(repo: Path, *args: str) -> str:
+def _git(repo: Path, *args: str, strip: bool = True) -> str:
     """调用 git。
 
     core.quotePath=false 是必须的：默认情况下 git 会把非 ASCII 路径转义成
     八进制（`"\\346\\226\\260.md"`），这些字符串会原样进 result.json，
     汇总层拿到的就是乱码。
+
+    strip=False 用于 `git show <branch>:<path>` 这种**取文件内容**的调用：
+    默认的 strip 会吃掉首行缩进和末尾换行，读命令输出无所谓，读源码就是
+    在悄悄改内容。
     """
     proc = subprocess.run(
         ["git", "-C", str(repo), "-c", "core.quotePath=false", *args],
@@ -57,7 +61,7 @@ def _git(repo: Path, *args: str) -> str:
             f"git {' '.join(args)} 失败 (code={proc.returncode})\n"
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
-    return proc.stdout.strip()
+    return proc.stdout.strip() if strip else proc.stdout
 
 
 def sanitize_branch(name: str) -> str:
@@ -214,6 +218,59 @@ def reset(ws: Workspace) -> dict[str, Any]:
         return {"reset": True, "discarded": discarded}
     except WorkspaceError as exc:
         return {"reset": False, "reason": str(exc)}
+
+
+def read_branch(repo: Path, branch: str, base: str | None = None, *,
+                max_files: int = 20, max_bytes: int = 4000) -> dict[str, Any]:
+    """从**分支**读取一个 Agent 的产出。
+
+    汇总层唯一允许的取数方式。结论 7 的直接后果：`--cleanup` 之后
+    `workspaces/<id>/` 就不存在了，分支才是产出的持久所在。凡是从工作目录
+    读的汇总，一开回收就会变成空的 —— 而那时 run 已经结束，错觉无法挽回。
+
+    base 应当传 `head_at_start`（建工作区时的 commit sha）而不是分支名：
+    分支名会随主线推进而漂移，那个 sha 才精确对应"这个 Agent 开工前的状态"。
+    """
+    repo = Path(repo)
+    base = base or f"{branch}^"
+    try:
+        raw = _git(repo, "diff", "--name-status", f"{base}..{branch}")
+    except WorkspaceError as exc:
+        return {"branch": branch, "error": str(exc), "files": []}
+
+    entries: list[tuple[str, str]] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip():
+            entries.append((parts[0].strip(), parts[-1].strip()))
+
+    files: list[dict[str, Any]] = []
+    for code, path in entries[:max_files]:
+        item: dict[str, Any] = {"path": path, "change": code}
+        if code.startswith("D"):
+            files.append(item)
+            continue
+        try:
+            text = _git(repo, "show", f"{branch}:{path}", strip=False)
+        except WorkspaceError as exc:
+            item["error"] = str(exc)
+            files.append(item)
+            continue
+        if "\x00" in text:
+            # 二进制文件的内容进简报没有意义，只会挤掉别人的额度
+            item["binary"] = True
+        else:
+            item["text"] = text[:max_bytes]
+            item["truncated"] = len(text) > max_bytes
+        files.append(item)
+
+    return {
+        "branch": branch,
+        "base": base,
+        "files": files,
+        "total_files": len(entries),
+        "omitted_files": max(0, len(entries) - max_files),
+    }
 
 
 def remove(ws: Workspace, *, delete_branch: bool = False) -> str:

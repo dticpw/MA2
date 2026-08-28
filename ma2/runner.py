@@ -7,7 +7,7 @@
     - 并行与 worktree 隔离  → ma2.orchestrator
     - 成败判定与重试        → ma2.policy + ma2.orchestrator
                               本模块只报告"这一次跑成了什么样"，不判断算不算成功
-    - 多 Agent 汇总         → 第四步
+    - 多 Agent 汇总         → ma2.aggregate
 
 设计要点：Agent 是 headless 子进程，不是交互式终端会话。因此这里没有 PTY、
 没有多路复用、没有按键注入，进程环境由编排器显式构造（handoff.md §9）。

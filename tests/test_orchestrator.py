@@ -490,6 +490,206 @@ class TestVerdict(OrchestratorCase):
         self.assertFalse(summary["agents"][0]["ok"])
 
 
+class TestAggregation(OrchestratorCase):
+    """第四阶段。两条命题：机械层无条件产出，综合层显式开启且允许失败。
+
+    汇总 Agent 用 echo 夹具 —— 它把 prompt 原样吐回来，于是"简报有没有
+    真的送到汇总 Agent 手里"变成一句可断言的话。只断言"汇总跑过了"证明不了
+    这件事。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.make_repo()
+        self.tasks = [
+            fake_task(f"a{i}", scenario="write",
+                      write_file="NOTES.md", write_text=f"分支内容-{i}",
+                      answer=f"答案-{i}", prompt=f"去做第 {i} 件事")
+            for i in range(2)
+        ]
+
+    def aggregator(self, **cfg):
+        """一个指向假 Agent 的 aggregator 配置。"""
+        task = fake_task("aggregator", **cfg)
+        return {"launcher": task["launcher"], "prompt": "把它们综合一下",
+                "timeout_sec": task["timeout_sec"], **{
+                    k: v for k, v in cfg.items()
+                    if k in ("retries", "retry_delay_sec")}}
+
+    def final_text(self) -> str:
+        return self.paths.final.read_text(encoding="utf-8")
+
+    # ------------------------------------------------------------- 机械层
+    def test_final_is_written_without_any_aggregator(self) -> None:
+        """没配汇总 Agent 也必须有 final.md —— 机械层不花钱、不可选。"""
+        orch = self.build(self.worktree_plan(self.repo, self.tasks))
+        summary = orch.execute()
+
+        self.assertTrue(self.paths.final.exists())
+        out = self.final_text()
+        self.assertIn("答案-0", out)
+        self.assertIn("答案-1", out)
+        self.assertIn("ma2/r1/a0", out)
+        self.assertIn("未启用综合层", out)
+        self.assertEqual(summary["final"], str(self.paths.final))
+
+    def test_aggregation_reads_branches_not_workspaces(self) -> None:
+        """结论 7 在编排层的锁：工作区被回收之后，汇总照样拿得到产出。
+
+        先断言工作目录真的没了 —— 否则这个测试可能是靠残留的目录通过的。
+        """
+        orch = self.build(self.worktree_plan(self.repo, self.tasks), cleanup=True)
+        orch.execute()
+
+        for i in range(2):
+            self.assertFalse(orch.workspaces[f"a{i}"].path.exists())
+        out = self.final_text()
+        self.assertIn("## 产出在哪", out)
+        self.assertIn("NOTES.md", out)
+        brief = self.paths.brief.read_text(encoding="utf-8")
+        self.assertIn("分支内容-0", brief, "分支上的文件内容必须进简报")
+        self.assertIn("分支内容-1", brief)
+
+    def test_failed_agents_still_appear_in_final(self) -> None:
+        tasks = [self.tasks[0], fake_task("a1", scenario="denial")]
+        orch = self.build(self.worktree_plan(self.repo, tasks))
+        orch.execute()
+        out = self.final_text()
+        self.assertIn("FAIL(permission_denied)", out)
+        self.assertIn("1/2 个 Agent 成功", out)
+
+    # ------------------------------------------------------------- 综合层
+    def test_synthesis_is_off_unless_asked_for(self) -> None:
+        """综合层要花钱，因此不能因为"看起来有用"就自己跑起来。"""
+        orch = self.build(self.worktree_plan(self.repo, self.tasks))
+        orch.execute()
+        self.assertNotIn("aggregator", orch.results)
+        self.assertIn("未启用综合层", self.final_text())
+
+    def test_brief_actually_reaches_the_aggregator(self) -> None:
+        """echo 夹具把收到的 prompt 当回答吐回来，于是简报的去向可被断言。"""
+        plan = self.worktree_plan(self.repo, self.tasks,
+                                  aggregator=self.aggregator(scenario="echo"))
+        orch = self.build(plan)
+        summary = orch.execute()
+
+        self.assertTrue(summary["aggregator"]["ok"])
+        out = self.final_text()
+        # 汇总 Agent 看到的必须包括：指令、各 Agent 的 prompt、回答、分支产出
+        self.assertIn("把它们综合一下", out)
+        self.assertIn("去做第 0 件事", out)
+        self.assertIn("答案-1", out)
+        self.assertIn("分支内容-0", out)
+        self.assertNotIn("未启用综合层", out)
+
+    def test_plan_entry_can_be_overridden_off(self) -> None:
+        """plan 里配了也要能一键关掉 —— 排障时不该被迫为每次重跑付钱。"""
+        plan = self.worktree_plan(self.repo, self.tasks,
+                                  aggregator=self.aggregator(scenario="echo"))
+        orch = self.build(plan, aggregate_with_agent=False)
+        orch.execute()
+        self.assertNotIn("aggregator", orch.results)
+        self.assertIn("未启用综合层", self.final_text())
+
+    # --------------------------------------------------- 综合失败不毁交付物
+    def test_synthesis_failure_does_not_destroy_final(self) -> None:
+        """核心命题：总结器挂了，这次 run 的成果不能跟着一起没。"""
+        plan = self.worktree_plan(
+            self.repo, self.tasks,
+            aggregator=self.aggregator(scenario="crash", retries=0))
+        orch = self.build(plan)
+        summary = orch.execute()
+
+        self.assertFalse(summary["aggregator"]["ok"])
+        out = self.final_text()
+        self.assertIn("综合层失败", out)
+        self.assertIn("答案-0", out, "各 Agent 的回答必须还在")
+        self.assertIn("ma2/r1/a1", out, "产出位置必须还在")
+
+    def test_synthesis_timeout_does_not_destroy_final(self) -> None:
+        plan = self.worktree_plan(
+            self.repo, self.tasks,
+            aggregator=self.aggregator(scenario="hang", timeout_sec=1.0,
+                                       retries=0))
+        orch = self.build(plan)
+        summary = orch.execute()
+        self.assertEqual(summary["aggregator"]["status"], P.TIMEOUT)
+        self.assertIn("综合层失败", self.final_text())
+        self.assertIn("答案-0", self.final_text())
+
+    def test_aggregator_crash_is_contained(self) -> None:
+        """执行器本身炸了（不是 Agent 失败）也不能拖垮收尾。"""
+        plan = self.worktree_plan(self.repo, self.tasks,
+                                  aggregator=self.aggregator(scenario="ok"))
+        orch = self.build(plan)
+        with mock.patch.object(Orchestrator, "run_with_retry",
+                               side_effect=RuntimeError("炸了")) as patched:
+            summary = orch.aggregate({"finished_at": P.utcnow(), "completed": 0})
+        self.assertTrue(patched.called)
+        self.assertFalse(summary["aggregator"]["ok"])
+        self.assertTrue(self.paths.final.exists())
+
+    # ------------------------------------------------------------ 记账口径
+    def test_aggregator_is_not_counted_as_one_of_the_agents(self) -> None:
+        """汇总器不是参与运算的 Agent。把它算进 ok/total 会让"2/2 成功"
+        变成"2/3"，一次成功的运行看起来像失败了。"""
+        plan = self.worktree_plan(self.repo, self.tasks,
+                                  aggregator=self.aggregator(scenario="echo"))
+        orch = self.build(plan)
+        summary = orch.execute()
+
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual([a["agent_id"] for a in summary["agents"]], ["a0", "a1"])
+        self.assertEqual(summary["status"], P.COMPLETED)
+
+    def test_aggregator_cost_is_added_to_the_run_total(self) -> None:
+        """汇总器不进 ok/total，但钱是它花的 —— 总额少算它就是账面比现实好看。"""
+        plan = self.worktree_plan(self.repo, self.tasks,
+                                  aggregator=self.aggregator(scenario="echo"))
+        orch = self.build(plan)
+        with mock.patch.object(Orchestrator, "run_aggregator",
+                               return_value={"ok": True, "answer": "综合",
+                                             "reasons": [], "status": P.COMPLETED,
+                                             "attempt": 1, "cost_usd": 0.25}):
+            summary = orch.execute()
+        self.assertEqual(summary["aggregator_cost_usd"], 0.25)
+        self.assertAlmostEqual(summary["total_cost_usd"],
+                               summary["agents_cost_usd"] + 0.25)
+        self.assertEqual(summary["total"], 2, "总额含汇总器，但计数不含")
+
+    def test_unknown_aggregator_cost_makes_the_total_a_lower_bound(self) -> None:
+        plan = self.worktree_plan(
+            self.repo, self.tasks,
+            aggregator=self.aggregator(scenario="hang", timeout_sec=1.0,
+                                       retries=0))
+        orch = self.build(plan)
+        summary = orch.execute()
+        self.assertFalse(summary["aggregator"]["cost_is_complete"],
+                         "超时的尝试收不到 result 事件，费用无从得知")
+        self.assertFalse(summary["cost_is_complete"])
+        self.assertEqual(summary["total_cost_usd"], summary["agents_cost_usd"],
+                         "未知费用按 0 计入，因此总额是下界")
+
+    def test_aggregator_leaves_its_own_audit_trail(self) -> None:
+        """汇总说错话时要能查它到底看到了什么、又吐了什么。"""
+        plan = self.worktree_plan(self.repo, self.tasks,
+                                  aggregator=self.aggregator(scenario="echo"))
+        orch = self.build(plan)
+        orch.execute()
+        self.assertTrue(self.paths.brief.exists())
+        self.assertTrue(self.paths.events("aggregator", 1).exists())
+        self.assertTrue(self.paths.result("aggregator").exists())
+
+    def test_plain_workspaces_aggregate_too(self) -> None:
+        """没有 git 仓库也要能汇总，只是没有分支产出可写。"""
+        orch = self.build({"run_name": "t", "tasks": [fake_task("a0")]})
+        orch.execute()
+        out = self.final_text()
+        self.assertIn("a0", out)
+        self.assertNotIn("## 产出在哪", out)
+
+
 class TestPlainWorkspaces(OrchestratorCase):
     def test_plain_mode_needs_no_repo(self) -> None:
         plan = {"tasks": [fake_task("a0", scenario="write",

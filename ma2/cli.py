@@ -65,6 +65,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         quiet=args.quiet,
         cleanup=args.cleanup,
         autocommit=args.autocommit,
+        aggregate_with_agent=args.aggregate,
     )
     summary = orch.execute()
 
@@ -91,6 +92,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"\n{summary['ok']}/{summary['total']} ok"
           f"（status=completed 的有 {summary['completed']} 个）"
           f"  {lead}${total_cost:.4f}  ->  {paths.dir}")
+    if "aggregator_cost_usd" in summary:
+        # 汇总器不在上面那张表里（它不是干活的 Agent），但钱是它花的 ——
+        # 总额含它，这里说清含了多少
+        agg = summary["aggregator_cost_usd"]
+        print(f"       其中汇总 Agent "
+              f"{f'${agg:.4f}' if isinstance(agg, (int, float)) else '费用未知'}")
+    print(f"汇总   : {paths.final}")
     return 0 if summary["status"] == P.COMPLETED else 1
 
 
@@ -146,6 +154,20 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_final(args: argparse.Namespace) -> int:
+    """打印某次 run 的 final.md。
+
+    单独一个子命令是因为 final.md 才是交付物 —— show 打的是各 Agent 的原始
+    回答，用于排障；final.md 是给人看结论的。
+    """
+    path = Path(args.run_dir).resolve() / "final.md"
+    if not path.exists():
+        print(f"没有 final.md: {path}", file=sys.stderr)
+        return 2
+    print(path.read_text(encoding="utf-8"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # 被重定向到文件或管道时 Python 默认块缓冲，进度会攒到进程结束才出现。
     # 观察面（tail 日志）要求实时性，这里强制行缓冲。
@@ -169,6 +191,13 @@ def main(argv: list[str] | None = None) -> int:
                        help="额外重试次数，压过 plan 的 run 级默认；task 级仍优先")
     p_run.add_argument("--cleanup", action="store_true",
                        help="收尾时移除 worktree（保留分支）")
+    agg = p_run.add_mutually_exclusive_group()
+    agg.add_argument("--aggregate", dest="aggregate", action="store_true",
+                     default=None,
+                     help="额外跑一个汇总 Agent 综合各方回答（要花钱）；"
+                          "机械汇总 final.md 无论如何都会写")
+    agg.add_argument("--no-aggregate", dest="aggregate", action="store_false",
+                     help="即使 plan 里配了 aggregator 也不跑综合层")
     p_run.add_argument("--no-commit", dest="autocommit", action="store_false",
                        help="不自动把 Agent 的改动提交到它的分支上")
     p_run.add_argument("--forward-anthropic", action="store_true",
@@ -178,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
     p_show = sub.add_parser("show", help="打印某次 run 的各 Agent 回答")
     p_show.add_argument("run_dir")
     p_show.set_defaults(func=cmd_show)
+
+    p_final = sub.add_parser("final", help="打印某次 run 的 final.md")
+    p_final.add_argument("run_dir")
+    p_final.set_defaults(func=cmd_final)
 
     p_prune = sub.add_parser("prune", help="回收某次 run 留下的 worktree")
     p_prune.add_argument("run_dir")

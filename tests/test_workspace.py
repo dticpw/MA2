@@ -199,6 +199,71 @@ class TestReset(WorktreeCase):
         self.assertEqual(W.reset(self.ws)["discarded"], 0)
 
 
+class TestReadBranch(WorktreeCase):
+    """汇总层的取数方式。核心命题：**工作区没了，产出还在。**"""
+
+    def commit_work(self) -> None:
+        (self.ws.path / "NOTES.md").write_text("我的结论\n", encoding="utf-8")
+        (self.ws.path / "README.md").write_text("base\n改了一行\n", encoding="utf-8")
+        W.commit_changes(self.ws, "work")
+
+    def test_reads_added_and_modified_files(self) -> None:
+        self.commit_work()
+        out = W.read_branch(self.repo, self.ws.branch, self.ws.head)
+        by_path = {f["path"]: f for f in out["files"]}
+        self.assertEqual(out["total_files"], 2)
+        self.assertEqual(by_path["NOTES.md"]["change"], "A")
+        self.assertEqual(by_path["NOTES.md"]["text"], "我的结论\n")
+        self.assertEqual(by_path["README.md"]["change"], "M")
+
+    def test_still_readable_after_the_worktree_is_removed(self) -> None:
+        """结论 7 的正面版本：回收掉工作目录，汇总照样读得到产出。
+
+        从工作目录读的汇总在这一步会变成空的 —— 而那时 run 已经结束了。
+        """
+        self.commit_work()
+        self.assertEqual(W.remove(self.ws), "removed")
+        self.assertFalse(self.ws.path.exists(), "前提：工作目录确实没了")
+        out = W.read_branch(self.repo, self.ws.branch, self.ws.head)
+        self.assertEqual(out["total_files"], 2)
+        self.assertIn("我的结论", out["files"][0]["text"] + out["files"][1]["text"])
+
+    def test_long_files_are_truncated_and_marked(self) -> None:
+        (self.ws.path / "BIG.md").write_text("x" * 5000, encoding="utf-8")
+        W.commit_changes(self.ws, "big")
+        out = W.read_branch(self.repo, self.ws.branch, self.ws.head, max_bytes=100)
+        item = next(f for f in out["files"] if f["path"] == "BIG.md")
+        self.assertEqual(len(item["text"]), 100)
+        self.assertTrue(item["truncated"])
+
+    def test_file_count_is_capped_but_the_total_is_still_reported(self) -> None:
+        for i in range(5):
+            (self.ws.path / f"f{i}.md").write_text(str(i), encoding="utf-8")
+        W.commit_changes(self.ws, "many")
+        out = W.read_branch(self.repo, self.ws.branch, self.ws.head, max_files=2)
+        self.assertEqual(len(out["files"]), 2)
+        self.assertEqual(out["total_files"], 5, "截断了也要说清一共有多少")
+        self.assertEqual(out["omitted_files"], 3)
+
+    def test_deleted_files_carry_no_content(self) -> None:
+        (self.ws.path / "README.md").unlink()
+        W.commit_changes(self.ws, "delete")
+        out = W.read_branch(self.repo, self.ws.branch, self.ws.head)
+        item = out["files"][0]
+        self.assertTrue(item["change"].startswith("D"))
+        self.assertNotIn("text", item)
+
+    def test_missing_branch_reports_an_error_instead_of_raising(self) -> None:
+        out = W.read_branch(self.repo, "ma2/nope", "main")
+        self.assertIn("error", out)
+        self.assertEqual(out["files"], [])
+
+    def test_empty_branch_yields_nothing(self) -> None:
+        out = W.read_branch(self.repo, self.ws.branch, self.ws.head)
+        self.assertEqual(out["files"], [])
+        self.assertEqual(out["total_files"], 0)
+
+
 class TestResetPlain(TempDirCase):
     def test_reset_empties_a_plain_workspace(self) -> None:
         ws = W.Workspace(agent_id="a", kind=W.PLAIN, path=self.tmp / "ws")

@@ -186,6 +186,12 @@ def main() -> int:
         emit(result_event(session, answer=""))
         return 0
 
+    if scenario == "echo":
+        # 把 prompt 原样当回答吐回来。汇总测试靠它证明简报**真的送到了**
+        # 汇总 Agent 手里 —— 只断言"汇总跑过了"是不够的。
+        emit(result_event(session, answer=prompt))
+        return 0
+
     if scenario == "write":
         # 真写文件：隔离测试要靠它证明各 Agent 互不覆盖
         path = args.write_file or "NOTES.md"

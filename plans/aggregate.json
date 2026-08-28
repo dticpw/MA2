@@ -1,0 +1,46 @@
+{
+  "run_name": "aggregate",
+  "max_parallel": 3,
+  "retries": 1,
+  "workspace_defaults": {
+    "kind": "worktree",
+    "repo": "E:/PG/MA2",
+    "base_ref": "main",
+    "branch_prefix": "ma2"
+  },
+  "tasks": [
+    {
+      "id": "taskkill",
+      "agent": "claude",
+      "prompt": "在当前目录创建 NOTES.md，用中文写一份 8 行以内的方案说明：在 Windows 上用 `taskkill /F /T /PID` 终止一个子进程树。第一行必须是 `# taskkill /T`。必须包含：它依赖什么才能找到子进程、什么情况下会失灵。然后在最终回复里用 3 行以内说明你为什么认为这是编排器应该采用的方案，以及它的代价。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，回复会被程序直接解析。只输出任务要求的内容本身，不要寒暄、复述任务、附加行动轨迹或总结。"
+    },
+    {
+      "id": "jobobject",
+      "agent": "claude",
+      "prompt": "在当前目录创建 NOTES.md，用中文写一份 8 行以内的方案说明：在 Windows 上用 Job Object 加 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 管理并终止子进程树。第一行必须是 `# Job Object`。必须包含：它相对于逐个杀进程强在哪、Python 标准库能不能直接做到。然后在最终回复里用 3 行以内说明你为什么认为这是编排器应该采用的方案，以及它的代价。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，回复会被程序直接解析。只输出任务要求的内容本身，不要寒暄、复述任务、附加行动轨迹或总结。"
+    },
+    {
+      "id": "ctrlbreak",
+      "agent": "claude",
+      "prompt": "在当前目录创建 NOTES.md，用中文写一份 8 行以内的方案说明：在 Windows 上用 CREATE_NEW_PROCESS_GROUP 加 CTRL_BREAK_EVENT 让子进程树自己优雅退出。第一行必须是 `# CTRL_BREAK`。必须包含：哪些程序会忽略这个信号、为什么它不能作为唯一手段。然后在最终回复里用 3 行以内说明你为什么认为这是编排器应该采用的方案，以及它的代价。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，回复会被程序直接解析。只输出任务要求的内容本身，不要寒暄、复述任务、附加行动轨迹或总结。"
+    }
+  ],
+  "aggregator": {
+    "agent": "claude",
+    "timeout_sec": 300,
+    "retries": 1,
+    "prompt": "下面是一次多 Agent 并行运行的简报。三个 Agent 各自被要求为一种终止进程树的做法辩护，因此它们的结论**必然互相冲突** —— 你的工作不是复述，而是裁决。用中文写一份 300 字以内的 Markdown 结论：\n\n1. 先说编排器实际该选哪个方案，或哪几个组合，一句话给出。\n2. 明确指出三份回答在哪里真的分歧、哪里只是换了说法在说同一件事。\n3. 如果有 Agent 失败或没给出理由，说明这让哪一条结论变得不可靠。\n\n不要编造简报里没有的事实。"
+  }
+}

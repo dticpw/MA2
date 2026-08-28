@@ -7,6 +7,8 @@
 
     runs/<run_id>/
         run.json                            运行元数据
+        final.md                            汇总产物：交付物本身
+        brief.md                            汇总 Agent 实际看到的输入
         agents/<agent_id>.attempt<N>.jsonl  原始事件流，每次尝试一份（审计依据）
         agents/<agent_id>.status.json
         agents/<agent_id>.result.json
@@ -89,6 +91,8 @@ class RunPaths:
         # 聚合状态：观察面只读这一个文件就能看到全部 Agent 的实时状态
         self.run_status = self.dir / "status.json"
         self.final = self.dir / "final.md"
+        # 汇总 Agent 实际看到的输入。汇总说错话时第一个要查的就是它。
+        self.brief = self.dir / "brief.md"
 
     def events(self, agent_id: str, attempt: int = 1) -> Path:
         """事件流按尝试次数分文件。
