@@ -14,6 +14,7 @@ index.lock**。因此所有 worktree 必须在派发 Agent 之前串行创建完
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,6 +171,49 @@ def is_dirty(ws: Workspace) -> bool:
         return bool(_git(ws.path, "status", "--porcelain"))
     except WorkspaceError:
         return False
+
+
+def reset(ws: Workspace) -> dict[str, Any]:
+    """把工作区恢复到 Agent 开工前的状态，供重试使用。
+
+    为什么默认要重置：`claude -p` 每次调用都是无状态的，第二次尝试拿到的是
+    同一段 prompt、没有上一次的记忆。让它看见上次留下的半成品，行为只会更
+    难预测 —— 可能重复写、可能以为已经做完了。干净起点才可复现。
+
+    上次尝试留下了什么并不会因此失传：完整的事件流在
+    `<id>.attempt<N>.jsonl` 里，改了几个文件也记在返回值里。工作区不承担
+    保存历史的职责。
+    """
+    if ws.kind == PLAIN:
+        discarded = 0
+        for child in ws.path.iterdir():
+            discarded += 1
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+        return {"reset": True, "discarded": discarded}
+
+    if ws.repo is None:
+        return {"reset": False, "reason": "not a workspace we can reset"}
+    try:
+        discarded = len([ln for ln in _git(ws.path, "status", "--porcelain").splitlines()
+                         if ln.strip()])
+        # reset --hard 只管已跟踪文件，Agent 新建的文件要靠 clean 才能清掉。
+        # 不加 -x：被 gitignore 的东西通常是环境产物，不是这次尝试的残留。
+        #
+        # 目标必须是 HEAD，不能是 ws.head（工作区创建时的那个 commit）。
+        # 用 ws.head 会把分支回退，连 Agent 自己 commit 过的成果一起抹掉 ——
+        # 那是结论 7 那类"静默销毁产出"的重演。重置该丢的是未提交的改动，
+        # 不是已经落到分支上的历史。
+        _git(ws.path, "reset", "--hard", "HEAD")
+        _git(ws.path, "clean", "-fd")
+        return {"reset": True, "discarded": discarded}
+    except WorkspaceError as exc:
+        return {"reset": False, "reason": str(exc)}
 
 
 def remove(ws: Workspace, *, delete_branch: bool = False) -> str:

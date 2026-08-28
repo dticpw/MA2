@@ -14,15 +14,16 @@ Windows 上的 headless 多 Agent 编排。
 "需要专门工具"降级成了"几行代码"。真正需要额外投入的只剩**人工实时观察**，
 而那一层是可选的、且与控制面完全解耦。
 
-## 当前进度：第二步（并行 + worktree 隔离）+ 测试
+## 当前进度：第三步（判定与重试）
 
 已完成：
 
 - **第一步** 单 Agent 启动 → 事件流原样落盘 → 增量归约出状态 → 产出 `result.json`，含超时执行与失败路径。
 - **第二步** 三阶段编排器：串行建 worktree → 并行派发 Agent → 串行提交并收尾。N=3 实测通过。
-- **测试** 90 个测试覆盖协议、归约、执行器、工作区与编排，全部离线运行。
+- **第三步** 判定层与重试：`status`（协议事实）与 `verdict`（成败判定）分离，权限被拒不重试，重试前重置工作区、每次尝试各自留审计流。
+- **测试** 140 个测试覆盖协议、归约、执行器、工作区、判定与编排，全部离线运行。
 
-刻意未做：重试策略（第三步）、多 Agent 汇总（第四步）。
+刻意未做：多 Agent 汇总（第四步）。
 
 ## 用法
 
@@ -33,7 +34,22 @@ D:/python/anaconda/envs/th123/python.exe -m ma2 prune runs/<run_id>
 ```
 
 `run` 常用开关：`--cleanup`（跑完回收工作区）、`--no-commit`（不自动提交）、
-`--max-parallel N`（plan 里的 `max_parallel` 优先）。
+`--max-parallel N`（plan 里的 `max_parallel` 优先）、`--retries N`（额外重试次数，
+压过 plan 的 run 级默认，task 级仍最高优先）。
+
+跑完打出的表按 `verdict` 而不是 `status` 算成败，失败的行末尾附原因：
+
+```
+agent          verdict  status     try branch                 dirty     sec  cost
+----------------------------------------------------------------------------------------
+denial-01      FAIL     completed    1 -                          -     8.7 $0.1350  permission_denied
+timeout-01     FAIL     timeout      2 -                          -    17.0 ≥$0.0000  timeout
+
+0/2 ok（status=completed 的有 1 个）  ≥$0.1350
+```
+
+`status=completed` 配 `verdict=FAIL` 不是矛盾，是两层事实：进程确实正常跑完了，
+但它什么都没干成。`≥` 表示费用是下界而非实测值（见结论 12）。
 
 无第三方依赖，只用标准库。
 
@@ -43,7 +59,7 @@ D:/python/anaconda/envs/th123/python.exe -m ma2 prune runs/<run_id>
 D:/python/anaconda/envs/th123/python.exe -m unittest discover -s tests -t .
 ```
 
-90 个测试，约 30 秒，**不花钱、不联网**。
+140 个测试，约 45 秒，**不花钱、不联网**。
 
 关键在 `tests/fake_agent.py`：一个 claude 兼容的测试替身，按 `--scenario` 吐脚本化的
 stream-json。真 claude 跑一次 N=3 隔离测试要 $0.9 / 17s，替身把同一个测试变成免费的，
@@ -58,10 +74,17 @@ stream-json。真 claude 跑一次 N=3 隔离测试要 $0.9 / 17s，替身把同
 | `garbage` | 非 JSON 行必须原样进审计流并被计数 |
 | `silent` | 进程正常退出却没有 result 事件 |
 | `denial` | `completed` 但 `permission_denials` 非空 —— 结论 3 |
+| `empty` | `completed` 但一个字都没回答 |
 | `write` | 真写文件，隔离测试靠它证明互不覆盖 |
+| `write-crash` | 留下半成品再失败 —— 重置工作区的夹具 |
+| `flaky` | 前 N 次失败、之后成功，失败形态可选（崩溃/挂起/权限） |
 
 超时那两条测试用**墙钟**断言，而不是断言状态字段。因为结论 4 的教训正是：超时被
 "检测"到很容易，被"执行"才难，只有墙钟能区分这两者。
+
+重试测试同样不满足于"重试发生了"：`flaky` 每次尝试写 `<n>-NOTES.md`，工作区有没有
+被重置可以被直接看见；每条"重试救回来了"的用例都配一条不给重试的反向对照，
+证明成功来自重试而不是夹具本来就会成功。
 
 ## 目录布局
 
@@ -69,12 +92,15 @@ stream-json。真 claude 跑一次 N=3 隔离测试要 $0.9 / 17s，替身把同
 runs/<run_id>/
     run.json                        运行元数据与最终汇总
     status.json                     全部 Agent 的聚合实时状态 —— 观察面只读这一个文件
-    agents/<id>.jsonl               原始事件流，只追加 —— 审计与回放的唯一依据
+    agents/<id>.attempt<N>.jsonl    原始事件流，按尝试分文件，只追加 —— 审计与回放的唯一依据
     agents/<id>.status.json         单 Agent 增量状态
     agents/<id>.result.json         正式产物，交给汇总层
     agents/<id>.stderr.log          仅在 stderr 非空时生成
     workspaces/<id>/                Agent 工作目录（worktree 模式下由 git 创建）
 ```
+
+事件流按尝试分文件，是因为重试**恰恰最需要保留失败那一次的证据**。让第二次尝试
+覆盖同一个文件，等于把最该留证的那份审计流删掉，与 §13「只追加」直接冲突。
 
 所有 JSON 写入走「同目录临时文件 + `os.replace`」，读者不会读到写了一半的文件。
 
@@ -89,6 +115,53 @@ runs/<run_id>/
 阶段 1 必须串行：`git worktree add` 会写目标仓库的 refs 和 index，并发必撞
 `index.lock`。阶段 2 可以并行：Agent 全程阻塞在子进程管道上，是 I/O 密集型，
 线程模型足够，不需要多进程。
+
+## 判定与重试
+
+`ma2/policy.py` 是纯判断层：不做 IO，只把一份 `result` 文档映射成一个 `Verdict`。
+
+**`status` 和 `verdict` 是两回事，不能合并。**
+
+- `status` 是**协议层事实**：事件流归约出来的终态（`completed` / `failed` /
+  `timeout`）。它回答"这个进程跑成什么样了"。
+- `verdict` 是**判定层结论**：这次运行算不算数。它回答"我们要不要认这个结果"。
+
+一次被权限全拦下的运行，`status` 是 `completed`（进程确实正常走完了），
+`verdict` 是 `FAIL(permission_denied)`（它什么都没干成）。把 `status` 直接改写成
+`failed` 会同时销毁前一个事实 —— 之后再想区分"进程崩了"和"进程好好跑完但被拦了"
+就没有依据了。审计流要留住发生了什么，判定层负责说这不算数。
+
+失败原因与是否重试：
+
+| 原因 | 触发条件 | 重试？ |
+|---|---|---|
+| `timeout` | watchdog 触发、进程被杀 | ✅ |
+| `crashed` | 进程退出但没有 result 事件，或 `is_error` | ✅ |
+| `empty_answer` | `completed` 但回答是空的 | ✅ |
+| `no_changes` | 开了 `require_changes` 却什么都没改 | ✅ |
+| `permission_denied` | `permission_denials` 非空 | ❌ |
+
+**权限被拒不重试**：同样的 `allowed_tools` 重试多少次都会被同样拦下，重试纯粹是
+把钱烧两遍。这是配置错误，不是抖动。只要有一个原因不可重试，整条判定就不重试。
+
+plan 里可配（task 级 > run 级 > 内置默认）：
+
+| key | 默认 | 含义 |
+|---|---|---|
+| `retries` | `0` | **额外**尝试次数，所以最多跑 `retries + 1` 次 |
+| `retry_delay_sec` | `2.0` | 线性退避基数 |
+| `reset_between_attempts` | `true` | 重试前把工作区恢复干净 |
+| `checks.deny_permission_denials` | `true` | 权限被拒算失败 |
+| `checks.require_answer` | `true` | 空回答算失败 |
+| `checks.require_changes` | `false` | 要求真的改了文件才算成功 |
+
+重试前默认重置工作区，因为 `claude -p` 每次调用都是无状态的：第二次尝试拿到的是
+同一段 prompt、没有上一次的记忆。让它看见上次留下的半成品，行为只会更难预测。
+重置只丢未提交的改动（`git reset --hard HEAD` + `git clean -fd`），已经落到分支上的
+历史不动。上一次尝试的完整记录留在它自己的 `attempt<N>.jsonl` 里，不会失传。
+
+`plans/retry.json` 是这两条命题的实测用例：一个必被权限拦下的任务（给 3 次重试，
+实际只跑 1 次）配一个必然超时的任务（给 1 次重试，跑满 2 次）。
 
 ## 实测结论
 
@@ -127,7 +200,12 @@ Agent 仍能正常认证 —— `claude` 自己从 `~/.claude/settings.json` 读
 但有个坑：这种情况下 `status` 仍然是 `completed`，`stop_reason` 仍然是
 `end_turn`。**`status == completed` 不足以判定任务成功**，编排器必须同时检查
 `permission_denials` 是否为空，否则会把一次"什么都没干成"的运行当成功收进汇总。
-这条留给第三步处理。
+
+第三步的处理方式是加一层 `verdict`，而不是把 `status` 改写成 `failed` ——
+两个事实都要留住（见「判定与重试」）。实测 `plans/retry.json` 里的 `denial-01`：
+`status=completed` 与 `verdict=FAIL(permission_denied)` 同时成立，汇总打出
+`0/2 ok（status=completed 的有 1 个）`，退出码 1。按旧口径这一跑会被报成
+"1/2 完成"。
 
 ### 4. Windows 进程树：超时必须用 taskkill /T
 
@@ -207,9 +285,38 @@ Python 的 stdout 默认走系统 ANSI 代码页（本机 GBK），假 Agent 不
 `errors="replace"` 会让它静默损坏而不是报错。目前 stream-json 假定 UTF-8，
 接入第二个厂商时要重新确认这一点。
 
+### 11. 「重置工作区」差点又一次销毁 Agent 的产出
+
+第一版 `reset()` 写的是 `git reset --hard ws.head` —— `ws.head` 是**建工作区时**
+记下的那个 commit。这在重试场景下会把分支整个回退，连 Agent 自己已经 commit 过的
+成果一起抹掉，正是结论 7 那类"回收动作静默销毁产出"的重演，只是换了个入口。
+
+抓到它的是一条断言"重置保留已有 commit"的测试，写完当场就红了。改成
+`git reset --hard HEAD` 后语义才对：重置该丢的是**未提交的改动**，不是已经落到
+分支上的历史。
+
+这是测试第三次在合并前抓到真 bug（前两次是 fd 泄漏和 git 八进制转义）。三次都
+不是"跑不起来"的错误，而是"跑得通但不对"——只有断言才拦得住。
+
+### 12. 超时的运行在账面上显示成 0 秒 0 美元
+
+`duration_ms` 和 `total_cost_usd` 都只来自 `result` 事件，而**超时的运行根本收不到
+那个事件**。于是 `plans/retry.json` 首次实测时，`timeout-01` 在汇总表里显示成
+`0.0s / $0.0000` —— 它实际上跑了两次尝试、每次都真的调了 API。一份把失败报得比
+现实便宜的账，比没有账更危险。
+
+耗时和费用在这里不对称，处理方式也就不同：
+
+- **耗时编排器自己能测。** `run_agent` 用 `time.monotonic()` 记墙钟写进
+  `metrics.wall_ms`，汇总取全部尝试之和（和费用一个口径，只报最后一次同样是瞒账）。
+  同一个 plan 修好后重跑，`timeout-01` 从 `0.0s` 变成 `17.0s`（两次 8 秒超时之和）。
+- **费用编排器无从得知。** 超时那次花了多少钱只有服务端知道。所以按 0 计入之后
+  标记 `cost_is_complete=false`，CLI 打成 `≥$0.0000` —— 明说这是下界，不是实测值。
+
+宁可显示一个承认自己不完整的数字，也不显示一个看起来精确的错数字。
+
 ## 后续
 
-- **第三步** 超时重试策略；把 `permission_denials` 非空纳入失败判定
 - **第四步** 汇总 agent，N 份 `result.json` → `final.md`（从分支读，不从工作目录读）
 - **待验证** `codex exec` 的结构化事件是否与 `stream-json` 等价。厂商中立是
   handoff §1 的硬要求，这个缺口目前仍未验证。

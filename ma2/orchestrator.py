@@ -9,15 +9,21 @@
     2. dispatch  并行。ThreadPoolExecutor，每个 Agent 一个线程。
                  Agent 是 I/O 密集（阻塞在子进程管道上），线程模型足够。
     3. collect   串行。收集 worktree 改动，写聚合状态，按需回收。
+
+第三步加入的是**判定与重试**（见 ma2.policy）：dispatch 里每个 Agent 跑的不再是
+一次 run_agent，而是"跑 → 判定 → 该重试就重置工作区再跑"的循环。汇总口径也
+随之从 status 改成 verdict。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from . import policy as PO
 from . import protocol as P
 from . import workspace as W
 from .runner import run_agent
@@ -91,18 +97,8 @@ class Orchestrator:
         n = len(self.tasks)
         self.note(f"\n阶段 2/3  并行派发 {n} 个 Agent（max_parallel={self.max_parallel}）")
 
-        def work(task: dict[str, Any]) -> dict[str, Any]:
-            agent_id = task["id"]
-            return run_agent(
-                task, self.paths,
-                workspace=self.workspaces[agent_id].path,
-                forward_anthropic=self.forward_anthropic,
-                log=lambda m, _id=agent_id: self.log(_id, m),
-                on_update=self.on_agent_update,
-            )
-
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
-            futures = {pool.submit(work, t): t["id"] for t in self.tasks}
+            futures = {pool.submit(self.run_with_retry, t): t["id"] for t in self.tasks}
             for fut in as_completed(futures):
                 agent_id = futures[fut]
                 try:
@@ -111,9 +107,85 @@ class Orchestrator:
                     self.log(agent_id, f"执行器异常: {exc!r}")
                     self.results[agent_id] = {
                         "agent_id": agent_id, "run_id": self.paths.run_id,
-                        "status": P.FAILED, "answer": None,
+                        "status": P.FAILED, "answer": None, "attempt": 0,
+                        "verdict": {"ok": False, "reasons": [PO.CRASHED],
+                                    "retryable": False},
                         "metrics": {}, "diagnostics": {"executor_error": repr(exc)},
                     }
+
+    def run_with_retry(self, task: dict[str, Any]) -> dict[str, Any]:
+        """跑一个 Agent，按策略重试，返回带 verdict 的最终 result。
+
+        重试判据来自 ma2.policy，不在这里现编。关键一条：权限被拒不重试 ——
+        同样的 allowed_tools 重试多少次都会被同样拦下，重试只是把钱烧两遍。
+        """
+        agent_id = task["id"]
+        ws = self.workspaces[agent_id]
+        checks = PO.resolve_checks(task, self.plan)
+        max_attempts, delay, do_reset = PO.retry_plan(task, self.plan)
+
+        attempts: list[dict[str, Any]] = []
+        result: dict[str, Any] = {}
+        verdict = PO.Verdict(ok=False, reasons=[PO.CRASHED])
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self.log(agent_id, f"retry   第 {attempt}/{max_attempts} 次尝试"
+                                   f"（上次: {'+'.join(verdict.reasons)}）")
+                if do_reset:
+                    info = W.reset(ws)
+                    if info.get("discarded"):
+                        self.log(agent_id, f"reset   丢弃上次尝试的 "
+                                           f"{info['discarded']} 处改动")
+                if delay:
+                    time.sleep(delay * (attempt - 1))  # 线性退避
+
+            result = run_agent(
+                task, self.paths, workspace=ws.path, attempt=attempt,
+                forward_anthropic=self.forward_anthropic,
+                log=lambda m, _id=agent_id: self.log(_id, m),
+                on_update=self.on_agent_update,
+            )
+
+            # require_changes 需要看工作区。git status 在各自的 worktree 里跑，
+            # 索引是每 worktree 独立的，并发不会撞 index.lock。
+            changes = W.collect_changes(ws) if checks.get("require_changes") else None
+            verdict = PO.evaluate(result, checks=checks, changes=changes)
+
+            attempts.append({
+                "attempt": attempt,
+                "status": result.get("status"),
+                "verdict": verdict.to_dict(),
+                "events_path": result.get("events_path"),
+                "duration_ms": (result.get("metrics") or {}).get("duration_ms"),
+                "wall_ms": (result.get("metrics") or {}).get("wall_ms"),
+                "total_cost_usd": (result.get("metrics") or {}).get("total_cost_usd"),
+            })
+
+            if verdict.ok:
+                break
+            if not verdict.retryable:
+                self.log(agent_id, f"verdict 失败且不可重试: {'+'.join(verdict.reasons)}")
+                break
+            if attempt == max_attempts:
+                self.log(agent_id, f"verdict 重试 {max_attempts} 次仍失败: "
+                                   f"{'+'.join(verdict.reasons)}")
+
+        result["attempt"] = len(attempts)
+        result["attempts"] = attempts
+        result["verdict"] = verdict.to_dict()
+        # 重试会重复计费，只报最后一次是在瞒账
+        result.setdefault("metrics", {})["cost_all_attempts_usd"] = sum(
+            a["total_cost_usd"] or 0.0 for a in attempts)
+        result["metrics"]["wall_ms_all_attempts"] = sum(
+            a["wall_ms"] or 0 for a in attempts)
+        # 超时的尝试收不到 result 事件，费用无从得知。它们在上面按 0 计入，
+        # 于是这个和是**下界而不是事实** —— 必须标出来，否则打印 $0.0000
+        # 会让人以为那次失败是免费的。耗时能靠墙钟自测，费用不能。
+        result["metrics"]["cost_is_complete"] = all(
+            a["total_cost_usd"] is not None for a in attempts)
+        P.write_atomic(self.paths.result(agent_id), result)
+        return result
 
     def on_agent_update(self, agent_id: str, snapshot: dict[str, Any]) -> None:
         """任一 Agent 状态变化就刷新聚合状态，供观察面读取。"""
@@ -167,21 +239,40 @@ class Orchestrator:
                 self.log(agent_id, f"worktree {W.remove(ws)}")
 
         ordered = [self.results[t["id"]] for t in self.tasks if t["id"] in self.results]
-        ok = sum(1 for r in ordered if r.get("status") == P.COMPLETED)
+        # 汇总按 verdict 算，不按 status 算。README 结论 3：一次被权限全拦下的
+        # 运行 status 也是 completed，按 status 汇总就是把失败报成成功。
+        ok = sum(1 for r in ordered if (r.get("verdict") or {}).get("ok"))
+        completed = sum(1 for r in ordered if r.get("status") == P.COMPLETED)
         summary = {
             "run_id": self.paths.run_id,
             "run_name": self.plan.get("run_name"),
             "finished_at": P.utcnow(),
             "status": P.COMPLETED if ok == len(ordered) and ordered else P.FAILED,
-            "completed": ok,
+            "ok": ok,
+            "completed": completed,
             "total": len(ordered),
+            "total_cost_usd": sum((r.get("metrics") or {}).get("cost_all_attempts_usd") or 0.0
+                                  for r in ordered),
+            "cost_is_complete": all((r.get("metrics") or {}).get("cost_is_complete", True)
+                                    for r in ordered),
             "agents": [{
                 "agent_id": r.get("agent_id"),
                 "status": r.get("status"),
+                "ok": bool((r.get("verdict") or {}).get("ok")),
+                "reasons": (r.get("verdict") or {}).get("reasons") or [],
+                "attempt": r.get("attempt"),
                 "branch": (r.get("workspace") or {}).get("branch"),
                 "dirty_files": (r.get("workspace") or {}).get("dirty_files"),
-                "duration_ms": (r.get("metrics") or {}).get("duration_ms"),
-                "total_cost_usd": (r.get("metrics") or {}).get("total_cost_usd"),
+                # 用墙钟而不是 result 事件里的 duration_ms，理由有两条：超时的运行
+                # 根本收不到 result 事件（duration_ms 是 None，一次真烧了钱的失败
+                # 会在表里显示成 0.0s），而重试过的运行只报最后一次也是在瞒账 ——
+                # 和 cost_all_attempts_usd 一个口径。
+                "duration_ms": ((r.get("metrics") or {}).get("wall_ms_all_attempts")
+                                or (r.get("metrics") or {}).get("wall_ms")
+                                or (r.get("metrics") or {}).get("duration_ms")),
+                "api_duration_ms": (r.get("metrics") or {}).get("duration_ms"),
+                "total_cost_usd": (r.get("metrics") or {}).get("cost_all_attempts_usd"),
+                "cost_is_complete": (r.get("metrics") or {}).get("cost_is_complete", True),
                 "permission_denials": len((r.get("diagnostics") or {}).get("permission_denials") or []),
             } for r in ordered],
         }

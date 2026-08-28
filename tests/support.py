@@ -24,7 +24,8 @@ def fake_task(agent_id: str, *, scenario: str = "ok", timeout_sec: float = 30.0,
     launcher 之后的参数会被 build_argv 原样透传给假 Agent。
     """
     flags: list[str] = ["--scenario", scenario]
-    for key in ("write_file", "write_text", "answer", "hang_sec"):
+    for key in ("write_file", "write_text", "answer", "hang_sec",
+                "counter_file", "fail_times", "fail_as"):
         if key in extra:
             flags += [f"--{key.replace('_', '-')}", str(extra.pop(key))]
     task: dict[str, Any] = {

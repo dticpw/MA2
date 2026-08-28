@@ -3,9 +3,10 @@
 第一步只做一件事：把一个 headless Agent 当成普通子进程跑起来，把它的事件流
 原样落盘，归约出终态，产出 result.json。
 
-刻意不做的事（留给后续步骤）：
-    - 并行与 worktree 隔离  → 第二步
-    - 超时重试策略          → 第三步（这里只有单次超时，不重试）
+刻意不做的事（分工，不是缺口）：
+    - 并行与 worktree 隔离  → ma2.orchestrator
+    - 成败判定与重试        → ma2.policy + ma2.orchestrator
+                              本模块只报告"这一次跑成了什么样"，不判断算不算成功
     - 多 Agent 汇总         → 第四步
 
 设计要点：Agent 是 headless 子进程，不是交互式终端会话。因此这里没有 PTY、
@@ -145,6 +146,7 @@ def build_argv(launcher: list[str], task: dict[str, Any]) -> list[str]:
 
 
 def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
+              attempt: int = 1,
               forward_anthropic: bool = False,
               log: Callable[[str], None] | None = None,
               on_update: Callable[[str, dict[str, Any]], None] | None = None,
@@ -153,6 +155,10 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
 
     workspace 由调用方预先准备好（见 ma2.workspace）。worktree 的创建必须串行，
     因此不能放在这里 —— 这个函数会被并行调用。
+
+    这里只负责"跑一次到终态"。要不要重试、算不算成功，是策略问题，归
+    ma2.policy 和编排器管 —— 本函数只报告协议层事实。attempt 只用于给事件流
+    分文件和写进快照，不改变任何行为。
     """
     agent_id = task["id"]
     say = log or (lambda _msg: None)
@@ -162,8 +168,8 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
     env = build_env(task.get("env_inject"), forward_anthropic=forward_anthropic)
     timeout_sec = float(task.get("timeout_sec", 600))
 
-    state = AgentState(agent_id, paths.run_id)
-    events_path = paths.events(agent_id)
+    state = AgentState(agent_id, paths.run_id, attempt=attempt)
+    events_path = paths.events(agent_id, attempt)
     status_path = paths.status(agent_id)
 
     def publish() -> None:
@@ -173,8 +179,11 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
             on_update(agent_id, snap)
 
     publish()
-    say(f"launch  {Path(launcher[-1]).name}  ws={workspace.name}  timeout={timeout_sec:g}s")
+    tag = "" if attempt == 1 else f"  attempt={attempt}"
+    say(f"launch  {Path(launcher[-1]).name}  ws={workspace.name}  "
+        f"timeout={timeout_sec:g}s{tag}")
 
+    t0 = time.monotonic()
     proc = subprocess.Popen(
         argv,
         cwd=str(workspace),
@@ -280,9 +289,13 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
     P.write_atomic(status_path, state.snapshot())
     publish()
     result = state.result_document(exit_code, str(events_path))
+    # duration_ms / total_cost_usd 都来自 result 事件，而超时的运行根本收不到
+    # 那个事件 —— 于是一次真花了钱的失败在账面上显示成 0 秒 0 美元。墙钟是
+    # 编排器自己能测的，至少让耗时不说谎。
+    result["metrics"]["wall_ms"] = int((time.monotonic() - t0) * 1000)
     result["diagnostics"]["timeout_fired"] = timed_out.is_set()
     result["diagnostics"]["timeout_sec"] = timeout_sec
     result["workspace"] = {"path": str(workspace)}
     P.write_atomic(paths.result(agent_id), result)
-    say(f"{state.status}  ({(state.duration_ms or 0) / 1000:.1f}s)")
+    say(f"{state.status}  ({result['metrics']['wall_ms'] / 1000:.1f}s)")
     return result

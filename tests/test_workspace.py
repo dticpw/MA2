@@ -169,5 +169,47 @@ class TestRemove(WorktreeCase):
         self.assertEqual(W.remove(plain), "skipped")
 
 
+class TestReset(WorktreeCase):
+    """重试前的工作区重置。"""
+
+    def test_reset_discards_new_and_modified_files(self) -> None:
+        """重试要从确定状态起步，否则第二次尝试面对的是上一次的半成品。"""
+        (self.ws.path / "NEW.md").write_text("新建的", encoding="utf-8")
+        (self.ws.path / "README.md").write_text("被改过", encoding="utf-8")
+        info = W.reset(self.ws)
+        self.assertTrue(info["reset"])
+        self.assertEqual(info["discarded"], 2)
+        self.assertFalse((self.ws.path / "NEW.md").exists())
+        self.assertEqual((self.ws.path / "README.md").read_text(encoding="utf-8"),
+                         "base\n")
+        self.assertFalse(W.is_dirty(self.ws))
+
+    def test_reset_keeps_commits_already_made(self) -> None:
+        """清的是未提交的残留，不是回滚已经落到分支上的东西。"""
+        (self.ws.path / "DONE.md").write_text("已提交", encoding="utf-8")
+        W.commit_changes(self.ws, "第一次的成果")
+        head = git(self.ws.path, "rev-parse", "HEAD")
+        (self.ws.path / "JUNK.md").write_text("残留", encoding="utf-8")
+        W.reset(self.ws)
+        self.assertFalse((self.ws.path / "JUNK.md").exists())
+        self.assertTrue((self.ws.path / "DONE.md").exists())
+        self.assertEqual(git(self.ws.path, "rev-parse", "HEAD"), head)
+
+    def test_reset_on_a_clean_worktree_is_harmless(self) -> None:
+        self.assertEqual(W.reset(self.ws)["discarded"], 0)
+
+
+class TestResetPlain(TempDirCase):
+    def test_reset_empties_a_plain_workspace(self) -> None:
+        ws = W.Workspace(agent_id="a", kind=W.PLAIN, path=self.tmp / "ws")
+        ws.path.mkdir()
+        (ws.path / "f.txt").write_text("x", encoding="utf-8")
+        (ws.path / "sub").mkdir()
+        (ws.path / "sub" / "g.txt").write_text("y", encoding="utf-8")
+        info = W.reset(ws)
+        self.assertEqual(info["discarded"], 2)
+        self.assertEqual(list(ws.path.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

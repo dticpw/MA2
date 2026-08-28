@@ -6,8 +6,8 @@
 目录布局：
 
     runs/<run_id>/
-        run.json                  运行元数据
-        agents/<agent_id>.jsonl   Agent 原始事件流（审计依据，只追加不修改）
+        run.json                            运行元数据
+        agents/<agent_id>.attempt<N>.jsonl  原始事件流，每次尝试一份（审计依据）
         agents/<agent_id>.status.json
         agents/<agent_id>.result.json
         agents/<agent_id>.stderr.log
@@ -90,8 +90,14 @@ class RunPaths:
         self.run_status = self.dir / "status.json"
         self.final = self.dir / "final.md"
 
-    def events(self, agent_id: str) -> Path:
-        return self.agents / f"{agent_id}.jsonl"
+    def events(self, agent_id: str, attempt: int = 1) -> Path:
+        """事件流按尝试次数分文件。
+
+        重试如果覆盖同一个文件，第一次尝试的审计流就没了 —— 而恰恰是失败的
+        那次尝试最需要留证。§13 要求审计流只追加不修改，每次尝试各占一个
+        文件是满足它的最简做法。
+        """
+        return self.agents / f"{agent_id}.attempt{attempt}.jsonl"
 
     def status(self, agent_id: str) -> Path:
         return self.agents / f"{agent_id}.status.json"

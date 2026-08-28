@@ -9,6 +9,8 @@
                 如果 terminate_tree 退回 proc.kill()，读取循环会永远阻塞。
     garbage     非 JSON 行必须原样进审计流，且被计入 malformed_lines。
     silent      进程正常退出却没有 result 事件，编排器必须自己兜底成 failed。
+    flaky       前 N 次失败、之后成功。重试策略唯一能被证伪的夹具 ——
+                只有同一个 task 两次跑出不同结果，才说明重试真的发生了。
 
 真 claude 的参数一律接受并忽略：这个替身要能被 build_argv 原样调用。
 """
@@ -71,6 +73,20 @@ def result_event(session: str, *, answer: str, is_error: bool = False,
     }
 
 
+def bump_counter(path: str | None) -> int:
+    """把调用次数记在工作区外的文件里，返回这是第几次（从 1 开始）。"""
+    if not path:
+        return 1
+    try:
+        n = int(open(path, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(n))
+    return n
+
+
 def main() -> int:
     force_utf8_stdout()
     ap = argparse.ArgumentParser(add_help=False)
@@ -79,6 +95,11 @@ def main() -> int:
     ap.add_argument("--write-text", default=None)
     ap.add_argument("--answer", default="ok")
     ap.add_argument("--hang-sec", type=float, default=600.0)
+    # flaky：靠计数文件跨进程记住"这是第几次尝试"。计数文件必须放在工作区
+    # 外面 —— 重试前工作区会被重置，放里面就永远数不过 1。
+    ap.add_argument("--counter-file", default=None)
+    ap.add_argument("--fail-times", type=int, default=1)
+    ap.add_argument("--fail-as", default="crash")
     # 真 claude 的参数，接受并丢弃
     ap.add_argument("-p", action="store_true")
     ap.add_argument("--output-format", default=None)
@@ -99,6 +120,15 @@ def main() -> int:
     session = str(uuid.uuid4())
     cwd = os.getcwd()
     scenario = args.scenario
+
+    if scenario == "flaky":
+        # 前 fail-times 次按 fail-as 失败，之后成功。重试策略的核心夹具：
+        # 只有"同一个 task 第二次跑出不同结果"才能证明重试真的发生了。
+        n = bump_counter(args.counter_file)
+        if args.write_file:
+            # 每次尝试写不同的文件名，工作区有没有被重置就能被直接看出来
+            args.write_file = f"{n}-{args.write_file}"
+        scenario = args.fail_as if n <= args.fail_times else "write"
 
     if scenario == "no-init":
         # 连 init 都没有就直接退出
@@ -142,6 +172,18 @@ def main() -> int:
             session, answer="我没有 Bash 权限，什么也没做成。",
             denials=[{"tool_name": "Bash", "tool_use_id": "tu_1"}],
         ))
+        return 0
+
+    if scenario == "write-crash":
+        # 留下半成品再失败 —— 重试前该不该清掉它，正是 reset 要回答的问题
+        with open(args.write_file or "NOTES.md", "w", encoding="utf-8") as fh:
+            fh.write(args.write_text if args.write_text is not None else "半成品")
+        emit(result_event(session, answer="写了一半就炸了", is_error=True))
+        return 1
+
+    if scenario == "empty":
+        # 正常收尾但一个字都没给。status 是 completed，任务却没有产出。
+        emit(result_event(session, answer=""))
         return 0
 
     if scenario == "write":

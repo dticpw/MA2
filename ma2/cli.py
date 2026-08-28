@@ -40,6 +40,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     run_id = args.run_id or new_run_id(plan.get("run_name", "run"))
+    if args.retries is not None:
+        # 显式给的开关压过 plan 的 run 级默认；task 级仍然最高优先
+        plan["retries"] = args.retries
     paths = P.RunPaths(Path(args.runs_root), run_id)
     paths.ensure()
 
@@ -65,19 +68,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     summary = orch.execute()
 
-    print(f"\n{'agent':<14} {'status':<10} {'branch':<34} {'dirty':>5} {'sec':>7}  cost")
+    print(f"\n{'agent':<14} {'verdict':<8} {'status':<10} {'try':>3} "
+          f"{'branch':<22} {'dirty':>5} {'sec':>7}  cost")
     print("-" * 88)
     for a in summary["agents"]:
         cost = a.get("total_cost_usd")
-        cost_s = f"${cost:.4f}" if isinstance(cost, (int, float)) else "-"
+        # 超时的尝试没有费用数据，按 0 计入 —— 打 ≥ 是提醒这是下界不是实测值
+        lead = "" if a.get("cost_is_complete", True) else "≥"
+        cost_s = f"{lead}${cost:.4f}" if isinstance(cost, (int, float)) else "-"
         secs = (a.get("duration_ms") or 0) / 1000
-        flag = "  !denials" if a.get("permission_denials") else ""
-        print(f"{a['agent_id']:<14} {a['status']:<10} "
-              f"{(a.get('branch') or '-'):<34} "
+        # 分支名前缀是 run_id，上面已经打过了，这里只显示末段
+        branch = (a.get("branch") or "-").rsplit("/", 1)[-1]
+        why = f"  {'+'.join(a.get('reasons') or [])}" if not a.get("ok") else ""
+        print(f"{a['agent_id']:<14} {'OK' if a.get('ok') else 'FAIL':<8} "
+              f"{a['status']:<10} {a.get('attempt') or '-':>3} "
+              f"{branch:<22} "
               f"{a.get('dirty_files') if a.get('dirty_files') is not None else '-':>5} "
-              f"{secs:>7.1f} {cost_s}{flag}")
+              f"{secs:>7.1f} {cost_s}{why}")
 
-    print(f"\n{summary['completed']}/{summary['total']} completed  ->  {paths.dir}")
+    total_cost = summary.get("total_cost_usd") or 0.0
+    lead = "" if summary.get("cost_is_complete", True) else "≥"
+    print(f"\n{summary['ok']}/{summary['total']} ok"
+          f"（status=completed 的有 {summary['completed']} 个）"
+          f"  {lead}${total_cost:.4f}  ->  {paths.dir}")
     return 0 if summary["status"] == P.COMPLETED else 1
 
 
@@ -122,9 +135,11 @@ def cmd_show(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     for path in sorted((run_dir / "agents").glob("*.result.json")):
         doc = P.read_json(path) or {}
+        verdict = doc.get("verdict") or {}
+        mark = "OK" if verdict.get("ok") else f"FAIL({'+'.join(verdict.get('reasons') or ['?'])})"
         print("=" * 72)
-        print(f"{doc.get('agent_id')}  status={doc.get('status')}  "
-              f"session={doc.get('session_id')}")
+        print(f"{doc.get('agent_id')}  {mark}  status={doc.get('status')}  "
+              f"attempt={doc.get('attempt')}  session={doc.get('session_id')}")
         print("=" * 72)
         print(doc.get("answer") or "(no answer)")
         print()
@@ -150,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--quiet", action="store_true")
     p_run.add_argument("--max-parallel", type=int, default=3,
                        help="并行上限，plan 里的 max_parallel 优先")
+    p_run.add_argument("--retries", type=int, default=None,
+                       help="额外重试次数，压过 plan 的 run 级默认；task 级仍优先")
     p_run.add_argument("--cleanup", action="store_true",
                        help="收尾时移除 worktree（保留分支）")
     p_run.add_argument("--no-commit", dest="autocommit", action="store_false",

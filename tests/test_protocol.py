@@ -79,11 +79,17 @@ class TestRunPaths(TempDirCase):
     def test_layout(self) -> None:
         paths = P.RunPaths(self.tmp / "runs", "r1")
         self.assertEqual(paths.dir, self.tmp / "runs" / "r1")
-        self.assertEqual(paths.events("a"), paths.agents / "a.jsonl")
+        self.assertEqual(paths.events("a"), paths.agents / "a.attempt1.jsonl")
         self.assertEqual(paths.status("a"), paths.agents / "a.status.json")
         self.assertEqual(paths.result("a"), paths.agents / "a.result.json")
         self.assertEqual(paths.workspace("a"), paths.workspaces / "a")
         self.assertEqual(paths.run_status, paths.dir / "status.json")
+
+    def test_each_attempt_gets_its_own_events_file(self) -> None:
+        """重试若覆盖同一个文件，失败那次的审计流就没了 —— 而它最需要留证。"""
+        paths = P.RunPaths(self.tmp / "runs", "r1")
+        self.assertNotEqual(paths.events("a", 1), paths.events("a", 2))
+        self.assertEqual(paths.events("a", 3), paths.agents / "a.attempt3.jsonl")
 
     def test_ensure_is_idempotent(self) -> None:
         paths = P.RunPaths(self.tmp / "runs", "r1")

@@ -26,9 +26,10 @@ class AgentState:
     每来一行调一次 update()，随时可以 snapshot() 出当前状态。
     """
 
-    def __init__(self, agent_id: str, run_id: str):
+    def __init__(self, agent_id: str, run_id: str, attempt: int = 1):
         self.agent_id = agent_id
         self.run_id = run_id
+        self.attempt = attempt
         self.status = P.STARTING
 
         self.session_id: str | None = None
@@ -124,6 +125,7 @@ class AgentState:
         return {
             "agent_id": self.agent_id,
             "run_id": self.run_id,
+            "attempt": self.attempt,
             "status": self.status,
             "session_id": self.session_id,
             "model": self.model,
@@ -143,6 +145,7 @@ class AgentState:
         return {
             "agent_id": self.agent_id,
             "run_id": self.run_id,
+            "attempt": self.attempt,
             "status": self.status,
             "session_id": self.session_id,
             "model": self.model,
