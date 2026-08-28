@@ -1,0 +1,14 @@
+{
+  "run_name": "hello",
+  "tasks": [
+    {
+      "id": "probe-01",
+      "agent": "claude",
+      "prompt": "在当前目录创建 findings.md，内容为一个 markdown 列表，列出 Windows 上无法使用 tmux 的三条具体原因，每条一行。然后在最终回复里只输出这个文件的绝对路径，不要输出别的任何内容。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器以 headless 方式调用的 worker agent，不是在与人对话。最终回复会被程序直接解析，因此只输出任务要求的内容本身：不要寒暄，不要复述任务，不要附加行动轨迹、总结、后续建议或任何解释性文字。"
+    }
+  ]
+}

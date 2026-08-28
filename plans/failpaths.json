@@ -1,0 +1,21 @@
+{
+  "run_name": "failpaths",
+  "tasks": [
+    {
+      "id": "denial-01",
+      "agent": "claude",
+      "prompt": "用 Bash 工具执行 `git --version` 并把输出原样告诉我。",
+      "allowed_tools": ["Read"],
+      "timeout_sec": 180,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，最终回复会被程序解析，只输出结果本身。"
+    },
+    {
+      "id": "timeout-01",
+      "agent": "claude",
+      "prompt": "逐条、详尽地写一篇不少于 3000 字的中文长文，主题是 Windows ConPTY 的历史与设计权衡。要写得非常详细。",
+      "allowed_tools": [],
+      "timeout_sec": 8,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent。"
+    }
+  ]
+}
