@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import protocol as P
 from .events import AgentState
@@ -119,12 +119,18 @@ def build_argv(launcher: str, task: dict[str, Any]) -> list[str]:
     return argv
 
 
-def run_agent(task: dict[str, Any], paths: P.RunPaths, *, forward_anthropic: bool = False,
-              echo: bool = True) -> dict[str, Any]:
-    """跑一个 Agent 到终态，返回 result 文档。"""
+def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
+              forward_anthropic: bool = False,
+              log: Callable[[str], None] | None = None,
+              on_update: Callable[[str, dict[str, Any]], None] | None = None,
+              ) -> dict[str, Any]:
+    """跑一个 Agent 到终态，返回 result 文档。
+
+    workspace 由调用方预先准备好（见 ma2.workspace）。worktree 的创建必须串行，
+    因此不能放在这里 —— 这个函数会被并行调用。
+    """
     agent_id = task["id"]
-    workspace = paths.workspace(agent_id)
-    workspace.mkdir(parents=True, exist_ok=True)
+    say = log or (lambda _msg: None)
 
     launcher = resolve_launcher(task.get("agent", "claude"))
     argv = build_argv(launcher, task)
@@ -134,12 +140,15 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, forward_anthropic: boo
     state = AgentState(agent_id, paths.run_id)
     events_path = paths.events(agent_id)
     status_path = paths.status(agent_id)
-    P.write_atomic(status_path, state.snapshot())
 
-    if echo:
-        print(f"[{agent_id}] launch  {Path(launcher).name}  cwd={workspace}")
-        print(f"[{agent_id}] env     {len(env)} vars (allowlist), forward_anthropic={forward_anthropic}")
-        print(f"[{agent_id}] timeout {timeout_sec:g}s")
+    def publish() -> None:
+        snap = state.snapshot()
+        P.write_atomic(status_path, snap)
+        if on_update:
+            on_update(agent_id, snap)
+
+    publish()
+    say(f"launch  {Path(launcher).name}  ws={workspace.name}  timeout={timeout_sec:g}s")
 
     proc = subprocess.Popen(
         argv,
@@ -206,12 +215,12 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, forward_anthropic: boo
                 continue
 
             state.update(event)
-            if echo and state.last_activity:
-                print(f"[{agent_id}] {state.status:<9} {state.last_activity}")
+            if state.last_activity:
+                say(f"{state.status:<9} {state.last_activity}")
 
             now = time.monotonic()
             if state.status != prev_status or (now - last_status_write) >= STATUS_WRITE_MIN_INTERVAL:
-                P.write_atomic(status_path, state.snapshot())
+                publish()
                 last_status_write = now
                 prev_status = state.status
 
@@ -238,8 +247,11 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, forward_anthropic: boo
             state.mark(P.FAILED, f"进程退出 code={exit_code} 但未收到 result 事件")
 
     P.write_atomic(status_path, state.snapshot())
+    publish()
     result = state.result_document(exit_code, str(events_path))
     result["diagnostics"]["timeout_fired"] = timed_out.is_set()
     result["diagnostics"]["timeout_sec"] = timeout_sec
+    result["workspace"] = {"path": str(workspace)}
     P.write_atomic(paths.result(agent_id), result)
+    say(f"{state.status}  ({(state.duration_ms or 0) / 1000:.1f}s)")
     return result

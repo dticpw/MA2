@@ -14,20 +14,25 @@ Windows 上的 headless 多 Agent 编排。
 "需要专门工具"降级成了"几行代码"。真正需要额外投入的只剩**人工实时观察**，
 而那一层是可选的、且与控制面完全解耦。
 
-## 当前进度：第一步（单 Agent 打通）
+## 当前进度：第二步（并行 + worktree 隔离）
 
-已完成：单 Agent 启动 → 事件流原样落盘 → 增量归约出状态 → 产出 `result.json`，
-含超时执行与失败路径。
+已完成：
 
-刻意未做：并行与 worktree 隔离（第二步）、重试策略（第三步）、多 Agent 汇总
-（第四步）。
+- **第一步** 单 Agent 启动 → 事件流原样落盘 → 增量归约出状态 → 产出 `result.json`，含超时执行与失败路径。
+- **第二步** 三阶段编排器：串行建 worktree → 并行派发 Agent → 串行提交并收尾。N=3 实测通过。
+
+刻意未做：重试策略（第三步）、多 Agent 汇总（第四步）。
 
 ## 用法
 
 ```powershell
-D:/python/anaconda/envs/th123/python.exe -m ma2 run plans/hello.json
-D:/python/anaconda/envs/th123/python.exe -m ma2 show runs/<run_id>
+D:/python/anaconda/envs/th123/python.exe -m ma2 run   plans/parallel3.json
+D:/python/anaconda/envs/th123/python.exe -m ma2 show  runs/<run_id>
+D:/python/anaconda/envs/th123/python.exe -m ma2 prune runs/<run_id>
 ```
+
+`run` 常用开关：`--cleanup`（跑完回收工作区）、`--no-commit`（不自动提交）、
+`--max-parallel N`（plan 里的 `max_parallel` 优先）。
 
 无第三方依赖，只用标准库。
 
@@ -35,15 +40,28 @@ D:/python/anaconda/envs/th123/python.exe -m ma2 show runs/<run_id>
 
 ```
 runs/<run_id>/
-    run.json                        运行元数据
+    run.json                        运行元数据与最终汇总
+    status.json                     全部 Agent 的聚合实时状态 —— 观察面只读这一个文件
     agents/<id>.jsonl               原始事件流，只追加 —— 审计与回放的唯一依据
-    agents/<id>.status.json         增量状态，供外部进程实时观察
+    agents/<id>.status.json         单 Agent 增量状态
     agents/<id>.result.json         正式产物，交给汇总层
     agents/<id>.stderr.log          仅在 stderr 非空时生成
-    workspaces/<id>/                Agent 工作目录
+    workspaces/<id>/                Agent 工作目录（worktree 模式下由 git 创建）
 ```
 
 所有 JSON 写入走「同目录临时文件 + `os.replace`」，读者不会读到写了一半的文件。
+
+## 执行模型
+
+```
+阶段 1  prepare   串行   git worktree add，任一失败则整体回滚
+阶段 2  dispatch  并行   ThreadPoolExecutor，每 Agent 一线程
+阶段 3  collect   串行   提交改动 → 收集 diff → 写汇总 → 按需回收
+```
+
+阶段 1 必须串行：`git worktree add` 会写目标仓库的 refs 和 index，并发必撞
+`index.lock`。阶段 2 可以并行：Agent 全程阻塞在子进程管道上，是 I/O 密集型，
+线程模型足够，不需要多进程。
 
 ## 实测结论
 
@@ -104,9 +122,41 @@ worker 继承用户的全局 `CLAUDE.md`，其中的输出格式约定（比如�
 对策：每个任务用 `system_suffix`（`--append-system-prompt`）显式声明输出契约，
 说明"回复会被程序解析，只输出结果本身"。已在 `plans/hello.json` 中示范。
 
+### 6. worktree 隔离确实成立
+
+`plans/parallel3.json` 让三个 Agent **写同一个文件名 `NOTES.md`**，各自要求不同的
+首行。如果隔离失效，它们必然互相覆盖。
+
+实测：三个工作区各拿到自己那份内容，仓库根目录没有 `NOTES.md`，`main` 未被触碰。
+三个 Agent 同毫秒启动、8.5s / 9.3s / 11.3s 分别结束，墙钟 17.3s —— 并行成立，
+worktree 隔离成立。
+
+### 7. 不自动提交，回收就等于销毁
+
+Agent 几乎不会自己 `git commit`，成果只存在于工作目录。而 `git worktree remove`
+必须加 `--force` 才能删掉脏工作区 —— 一删就把未提交的改动一并删了。
+
+第一次跑完 `remove` 后实测：分支还在，但 `git show <branch>:NOTES.md` 报
+`path does not exist`，分支停在 `main` 的 commit 上，**Agent 的产出全没了**。
+"保留分支"在没提交的前提下是句空话。
+
+因此 `collect` 阶段默认先 `git add -A && git commit` 到该 Agent 的分支（提交者
+身份显式指定为 `ma2-orchestrator`，不依赖机器上恰好配了 `user.name`），之后
+工作区才是一次性的。`prune` 同样默认拒绝删除脏工作区，除非显式 `--force`。
+
+这条对第四步有直接影响：汇总层应该从**分支**读产出，而不是从可能已被回收的
+工作目录读。
+
+### 8. worktree 注册会无限累积
+
+每次 run 留下 N 个 worktree 注册在 `.git/worktrees` 里，而 `runs/` 是 gitignore 的。
+用户手工删掉 `runs/` 目录后注册信息仍在，git 会一直把它们报成 prunable。
+所以回收需要正规出口：`ma2 prune runs/<run_id>`。
+
 ## 后续
 
-- **第二步** 并行 + `git worktree` 隔离，N=3
 - **第三步** 超时重试策略；把 `permission_denials` 非空纳入失败判定
-- **第四步** 汇总 agent，N 份 `result.json` → `final.md`
+- **第四步** 汇总 agent，N 份 `result.json` → `final.md`（从分支读，不从工作目录读）
+- **待验证** `codex exec` 的结构化事件是否与 `stream-json` 等价。厂商中立是
+  handoff §1 的硬要求，这个缺口目前仍未验证。
 - **之后** 再决定是否需要观察面。跑通前四步才有依据回答这个问题。

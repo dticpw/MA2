@@ -14,7 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 from . import protocol as P
-from .runner import run_agent
+from . import workspace as W
+from .orchestrator import Orchestrator
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUNS = REPO_ROOT / "runs"
@@ -33,6 +34,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"plan 里没有 tasks: {plan_path}", file=sys.stderr)
         return 2
 
+    ids = [t["id"] for t in tasks]
+    if len(set(ids)) != len(ids):
+        print(f"plan 里有重复的 task id: {ids}", file=sys.stderr)
+        return 2
+
     run_id = args.run_id or new_run_id(plan.get("run_name", "run"))
     paths = P.RunPaths(Path(args.runs_root), run_id)
     paths.ensure()
@@ -42,41 +48,74 @@ def cmd_run(args: argparse.Namespace) -> int:
         "run_name": plan.get("run_name"),
         "plan_path": str(plan_path),
         "created_at": P.utcnow(),
-        "task_ids": [t["id"] for t in tasks],
+        "task_ids": ids,
         "status": P.RUNNING,
     })
-    print(f"run_id: {run_id}")
-    print(f"run_dir: {paths.dir}\n")
+    print(f"run_id : {run_id}")
+    print(f"run_dir: {paths.dir}")
+    print(f"观察   : {paths.run_status}\n")
 
-    # 第一步刻意串行。并行是第二步，而且要连 worktree 隔离一起做。
-    results = []
-    for task in tasks:
-        results.append(run_agent(
-            task, paths,
-            forward_anthropic=args.forward_anthropic,
-            echo=not args.quiet,
-        ))
-        print()
+    orch = Orchestrator(
+        plan, paths,
+        max_parallel=args.max_parallel,
+        forward_anthropic=args.forward_anthropic,
+        quiet=args.quiet,
+        cleanup=args.cleanup,
+        autocommit=args.autocommit,
+    )
+    summary = orch.execute()
 
-    ok = sum(1 for r in results if r["status"] == P.COMPLETED)
-    P.write_atomic(paths.run_json, {
-        **(P.read_json(paths.run_json) or {}),
-        "finished_at": P.utcnow(),
-        "status": P.COMPLETED if ok == len(results) else P.FAILED,
-        "completed": ok,
-        "total": len(results),
-    })
-
-    for r in results:
-        m = r["metrics"]
-        cost = m.get("total_cost_usd")
-        secs = (m.get("duration_ms") or 0) / 1000
+    print(f"\n{'agent':<14} {'status':<10} {'branch':<34} {'dirty':>5} {'sec':>7}  cost")
+    print("-" * 88)
+    for a in summary["agents"]:
+        cost = a.get("total_cost_usd")
         cost_s = f"${cost:.4f}" if isinstance(cost, (int, float)) else "-"
-        print(f"{r['agent_id']:<16} {r['status']:<10} "
-              f"turns={m.get('num_turns')!s:<5} {secs:>6.1f}s  {cost_s}")
+        secs = (a.get("duration_ms") or 0) / 1000
+        flag = "  !denials" if a.get("permission_denials") else ""
+        print(f"{a['agent_id']:<14} {a['status']:<10} "
+              f"{(a.get('branch') or '-'):<34} "
+              f"{a.get('dirty_files') if a.get('dirty_files') is not None else '-':>5} "
+              f"{secs:>7.1f} {cost_s}{flag}")
 
-    print(f"\n{ok}/{len(results)} completed  ->  {paths.dir}")
-    return 0 if ok == len(results) else 1
+    print(f"\n{summary['completed']}/{summary['total']} completed  ->  {paths.dir}")
+    return 0 if summary["status"] == P.COMPLETED else 1
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    """回收某次 run 留下的 worktree。
+
+    worktree 不回收就会永久留在 .git/worktrees 里。而 runs/ 是 gitignore 的，
+    用户手工删掉目录后注册信息还在，git 会一直报 prunable —— 所以要有正规出口。
+    分支默认保留：里面是 Agent 的劳动成果。
+    """
+    run_dir = Path(args.run_dir).resolve()
+    n = 0
+    for path in sorted((run_dir / "agents").glob("*.result.json")):
+        doc = P.read_json(path) or {}
+        ws = doc.get("workspace") or {}
+        if ws.get("kind") != W.WORKTREE or not ws.get("path"):
+            continue
+        obj = W.Workspace(
+            agent_id=doc.get("agent_id", path.stem),
+            kind=W.WORKTREE,
+            path=Path(ws["path"]),
+            repo=Path(ws.get("repo") or REPO_ROOT),
+            branch=ws.get("branch"),
+            base_ref=ws.get("base_ref"),
+            head=ws.get("head_at_start"),
+        )
+        # worktree remove 必须 --force 才能删脏工作区，而 --force 会连未提交的
+        # 改动一起删。默认拒绝，别让回收动作静默销毁 Agent 的成果。
+        if W.is_dirty(obj) and not args.force:
+            print(f"{obj.agent_id:<14} 拒绝：工作区有未提交改动，"
+                  f"先提交或加 --force")
+            n += 1
+            continue
+        print(f"{obj.agent_id:<14} {W.remove(obj, delete_branch=args.delete_branches)}")
+        n += 1
+    print(f"\n处理 {n} 个 worktree"
+          f"{'，分支已一并删除' if args.delete_branches else '，分支保留'}")
+    return 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -109,6 +148,12 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--runs-root", default=str(DEFAULT_RUNS))
     p_run.add_argument("--run-id", default=None)
     p_run.add_argument("--quiet", action="store_true")
+    p_run.add_argument("--max-parallel", type=int, default=3,
+                       help="并行上限，plan 里的 max_parallel 优先")
+    p_run.add_argument("--cleanup", action="store_true",
+                       help="收尾时移除 worktree（保留分支）")
+    p_run.add_argument("--no-commit", dest="autocommit", action="store_false",
+                       help="不自动把 Agent 的改动提交到它的分支上")
     p_run.add_argument("--forward-anthropic", action="store_true",
                        help="排障用：把 ANTHROPIC_*/CLAUDE_* 转发进子进程环境")
     p_run.set_defaults(func=cmd_run)
@@ -116,6 +161,14 @@ def main(argv: list[str] | None = None) -> int:
     p_show = sub.add_parser("show", help="打印某次 run 的各 Agent 回答")
     p_show.add_argument("run_dir")
     p_show.set_defaults(func=cmd_show)
+
+    p_prune = sub.add_parser("prune", help="回收某次 run 留下的 worktree")
+    p_prune.add_argument("run_dir")
+    p_prune.add_argument("--force", action="store_true",
+                         help="即使工作区有未提交改动也删除（会丢失这些改动）")
+    p_prune.add_argument("--delete-branches", action="store_true",
+                         help="连同分支一起删除（会丢失 Agent 的改动）")
+    p_prune.set_defaults(func=cmd_prune)
 
     args = parser.parse_args(argv)
     return args.func(args)

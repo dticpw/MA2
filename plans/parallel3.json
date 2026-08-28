@@ -1,0 +1,39 @@
+{
+  "run_name": "parallel3",
+  "max_parallel": 3,
+  "workspace_defaults": {
+    "kind": "worktree",
+    "repo": "E:/PG/MA2",
+    "base_ref": "main",
+    "branch_prefix": "ma2"
+  },
+  "tasks": [
+    {
+      "id": "conpty",
+      "agent": "claude",
+      "prompt": "在当前目录创建 NOTES.md，写一段 5 行以内的中文说明，主题是 Windows ConPTY 相对于旧版控制台 API 解决了什么问题。第一行必须是 `# ConPTY`。写完后最终回复只输出该文件的第一行内容，不要输出别的。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，回复会被程序直接解析。只输出任务要求的内容本身，不要寒暄、复述任务、附加行动轨迹或总结。"
+    },
+    {
+      "id": "junction",
+      "agent": "claude",
+      "prompt": "在当前目录创建 NOTES.md，写一段 5 行以内的中文说明，主题是 Windows Junction 与符号链接的区别。第一行必须是 `# Junction`。写完后最终回复只输出该文件的第一行内容，不要输出别的。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，回复会被程序直接解析。只输出任务要求的内容本身，不要寒暄、复述任务、附加行动轨迹或总结。"
+    },
+    {
+      "id": "jobobject",
+      "agent": "claude",
+      "prompt": "在当前目录创建 NOTES.md，写一段 5 行以内的中文说明，主题是 Windows Job Object 如何用于管理子进程树。第一行必须是 `# JobObject`。写完后最终回复只输出该文件的第一行内容，不要输出别的。",
+      "allowed_tools": ["Write", "Read"],
+      "permission_mode": "acceptEdits",
+      "timeout_sec": 300,
+      "system_suffix": "你是被编排器 headless 调用的 worker agent，回复会被程序直接解析。只输出任务要求的内容本身，不要寒暄、复述任务、附加行动轨迹或总结。"
+    }
+  ]
+}

@@ -86,6 +86,9 @@ class RunPaths:
         self.agents = self.dir / "agents"
         self.workspaces = self.dir / "workspaces"
         self.run_json = self.dir / "run.json"
+        # 聚合状态：观察面只读这一个文件就能看到全部 Agent 的实时状态
+        self.run_status = self.dir / "status.json"
+        self.final = self.dir / "final.md"
 
     def events(self, agent_id: str) -> Path:
         return self.agents / f"{agent_id}.jsonl"
