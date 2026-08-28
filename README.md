@@ -14,12 +14,13 @@ Windows 上的 headless 多 Agent 编排。
 "需要专门工具"降级成了"几行代码"。真正需要额外投入的只剩**人工实时观察**，
 而那一层是可选的、且与控制面完全解耦。
 
-## 当前进度：第二步（并行 + worktree 隔离）
+## 当前进度：第二步（并行 + worktree 隔离）+ 测试
 
 已完成：
 
 - **第一步** 单 Agent 启动 → 事件流原样落盘 → 增量归约出状态 → 产出 `result.json`，含超时执行与失败路径。
 - **第二步** 三阶段编排器：串行建 worktree → 并行派发 Agent → 串行提交并收尾。N=3 实测通过。
+- **测试** 90 个测试覆盖协议、归约、执行器、工作区与编排，全部离线运行。
 
 刻意未做：重试策略（第三步）、多 Agent 汇总（第四步）。
 
@@ -35,6 +36,32 @@ D:/python/anaconda/envs/th123/python.exe -m ma2 prune runs/<run_id>
 `--max-parallel N`（plan 里的 `max_parallel` 优先）。
 
 无第三方依赖，只用标准库。
+
+## 测试
+
+```powershell
+D:/python/anaconda/envs/th123/python.exe -m unittest discover -s tests -t .
+```
+
+90 个测试，约 30 秒，**不花钱、不联网**。
+
+关键在 `tests/fake_agent.py`：一个 claude 兼容的测试替身，按 `--scenario` 吐脚本化的
+stream-json。真 claude 跑一次 N=3 隔离测试要 $0.9 / 17s，替身把同一个测试变成免费的，
+于是可以常跑、可以在改动前后对比。`task.launcher` 是它的接入点 —— 这个字段同时也是
+厂商中立（§1）的接缝：换一个 claude 兼容的可执行文件，编排层不用改。
+
+替身能演出每一种实测撞到过的失败形态，其中三个直接对应已修的 bug：
+
+| scenario | 演的是什么 |
+|---|---|
+| `hang-tree` | 派生持有 stdout 的孙进程 —— 结论 4 的回归夹具 |
+| `garbage` | 非 JSON 行必须原样进审计流并被计数 |
+| `silent` | 进程正常退出却没有 result 事件 |
+| `denial` | `completed` 但 `permission_denials` 非空 —— 结论 3 |
+| `write` | 真写文件，隔离测试靠它证明互不覆盖 |
+
+超时那两条测试用**墙钟**断言，而不是断言状态字段。因为结论 4 的教训正是：超时被
+"检测"到很容易，被"执行"才难，只有墙钟能区分这两者。
 
 ## 目录布局
 
@@ -152,6 +179,33 @@ Agent 几乎不会自己 `git commit`，成果只存在于工作目录。而 `gi
 每次 run 留下 N 个 worktree 注册在 `.git/worktrees` 里，而 `runs/` 是 gitignore 的。
 用户手工删掉 `runs/` 目录后注册信息仍在，git 会一直把它们报成 prunable。
 所以回收需要正规出口：`ma2 prune runs/<run_id>`。
+
+### 9. 补测试当场抓到两个真 bug
+
+测试不是给已知正确的代码盖章，它当场抓到了两处此前没人发现的问题：
+
+**文件描述符泄漏。** `run_agent` 从不关闭子进程的 stdin/stdout/stderr 管道。
+单跑一次看不出来，但编排器会并行反复起 Agent，泄漏会累积。测试跑完刷出一片
+`ResourceWarning: unclosed file` 才暴露。现已改为 try/finally 中统一关闭，并且
+无论正常结束还是中途抛异常，都不会留下活着的子进程。测试用
+`-W error::ResourceWarning` 把它钉死。
+
+**非 ASCII 路径被 git 转义成八进制。** `git status --porcelain` 默认把中文文件名
+输出成 `"\346\226\260.md"`，这些字符串会原样进 `result.json`，汇总层拿到的是乱码。
+所有 git 调用现已带上 `-c core.quotePath=false`。
+
+两个都是"跑得通但不对"的问题，只有写测试才会撞上。
+
+### 10. 测试替身必须在编码上也忠实
+
+编排器按 UTF-8 读子进程 stdout。真 claude 是 node，本来就吐 UTF-8；而 Windows 上
+Python 的 stdout 默认走系统 ANSI 代码页（本机 GBK），假 Agent 不显式
+`reconfigure(encoding="utf-8")` 就会吐出乱码 —— 测出来的是替身的毛病，不是被测
+代码的毛病。
+
+顺带暴露一个潜在的厂商中立风险：如果某个 CLI 按 locale 编码输出，
+`errors="replace"` 会让它静默损坏而不是报错。目前 stream-json 假定 UTF-8，
+接入第二个厂商时要重新确认这一点。
 
 ## 后续
 

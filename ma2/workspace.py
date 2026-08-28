@@ -41,8 +41,14 @@ class Workspace:
 
 
 def _git(repo: Path, *args: str) -> str:
+    """调用 git。
+
+    core.quotePath=false 是必须的：默认情况下 git 会把非 ASCII 路径转义成
+    八进制（`"\\346\\226\\260.md"`），这些字符串会原样进 result.json，
+    汇总层拿到的就是乱码。
+    """
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", str(repo), "-c", "core.quotePath=false", *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if proc.returncode != 0:

@@ -63,6 +63,21 @@ def terminate_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def close_streams(proc: subprocess.Popen) -> None:
+    """关掉子进程的三个管道。
+
+    Popen 不会自己关。单跑一次看不出来，但编排器会并行反复起 Agent，
+    不关就是持续泄漏文件描述符。
+    """
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def build_env(inject: dict[str, str] | None = None, forward_anthropic: bool = False) -> dict[str, str]:
     """按白名单构造子进程环境。
 
@@ -79,29 +94,39 @@ def build_env(inject: dict[str, str] | None = None, forward_anthropic: bool = Fa
     return env
 
 
-def resolve_launcher(agent_kind: str) -> str:
-    """把 Agent 类型解析成可执行文件绝对路径。
+def resolve_launcher(agent_kind: str, override: Any = None) -> list[str]:
+    """把 Agent 类型解析成启动命令。
+
+    返回的是 argv 前缀而不是单个路径：启动命令可能是多段的（例如
+    `python fake_agent.py`）。task 里给了 launcher 就用它 —— 这既是测试替身的
+    接入点，也是厂商中立（§1）的接缝：换一个 claude 兼容的可执行文件，
+    编排层不用改。
 
     Windows 上 npm 装的 claude 是 claude.cmd；Python 的 subprocess 能直接拉起
     .cmd，但必须给绝对路径，不能依赖 PATH 解析。
     """
+    if override:
+        if isinstance(override, (list, tuple)):
+            return [str(x) for x in override]
+        return [str(override)]
     if agent_kind == "claude":
         for cand in ("claude.cmd", "claude.exe", "claude"):
             found = shutil.which(cand)
             if found:
-                return found
+                return [found]
         raise AgentLaunchError("PATH 上找不到 claude，先确认 npm 全局 bin 在 PATH 里")
-    raise AgentLaunchError(f"第一步只支持 agent=claude，收到 {agent_kind!r}")
+    raise AgentLaunchError(f"目前只支持 agent=claude，收到 {agent_kind!r}；"
+                           f"或在 task 里显式给出 launcher")
 
 
-def build_argv(launcher: str, task: dict[str, Any]) -> list[str]:
+def build_argv(launcher: list[str], task: dict[str, Any]) -> list[str]:
     """构造 headless 调用。
 
     prompt 走 stdin 而不是 argv：Windows 命令行有长度上限，而且 prompt 里
     的引号和换行走 argv 极易出错。
     """
     argv = [
-        launcher,
+        *launcher,
         "-p",
         "--output-format", "stream-json",
         "--verbose",  # stream-json 在 print 模式下需要它才会吐完整事件
@@ -132,7 +157,7 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
     agent_id = task["id"]
     say = log or (lambda _msg: None)
 
-    launcher = resolve_launcher(task.get("agent", "claude"))
+    launcher = resolve_launcher(task.get("agent", "claude"), task.get("launcher"))
     argv = build_argv(launcher, task)
     env = build_env(task.get("env_inject"), forward_anthropic=forward_anthropic)
     timeout_sec = float(task.get("timeout_sec", 600))
@@ -148,7 +173,7 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
             on_update(agent_id, snap)
 
     publish()
-    say(f"launch  {Path(launcher).name}  ws={workspace.name}  timeout={timeout_sec:g}s")
+    say(f"launch  {Path(launcher[-1]).name}  ws={workspace.name}  timeout={timeout_sec:g}s")
 
     proc = subprocess.Popen(
         argv,
@@ -195,43 +220,49 @@ def run_agent(task: dict[str, Any], paths: P.RunPaths, *, workspace: Path,
     last_status_write = 0.0
     prev_status = state.status
 
-    with open(events_path, "w", encoding="utf-8", newline="\n") as sink:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            # 无条件先原样落盘再解析。审计流的完整性优先于解析成功与否（§13）。
-            sink.write(line if line.endswith("\n") else line + "\n")
-            sink.flush()
-
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                event = json.loads(stripped)
-            except json.JSONDecodeError:
-                state.malformed_lines += 1
-                continue
-            if not isinstance(event, dict):
-                state.malformed_lines += 1
-                continue
-
-            state.update(event)
-            if state.last_activity:
-                say(f"{state.status:<9} {state.last_activity}")
-
-            now = time.monotonic()
-            if state.status != prev_status or (now - last_status_write) >= STATUS_WRITE_MIN_INTERVAL:
-                publish()
-                last_status_write = now
-                prev_status = state.status
-
     try:
-        exit_code = proc.wait(timeout=KILL_GRACE_SEC)
-    except subprocess.TimeoutExpired:
-        # 管道已关闭但进程还没收尸，再补一刀
-        terminate_tree(proc)
-        exit_code = proc.wait(timeout=KILL_GRACE_SEC)
-    watchdog.cancel()
-    stderr_thread.join(timeout=5)
+        with open(events_path, "w", encoding="utf-8", newline="\n") as sink:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                # 无条件先原样落盘再解析。审计流的完整性优先于解析成功与否（§13）。
+                sink.write(line if line.endswith("\n") else line + "\n")
+                sink.flush()
+
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    state.malformed_lines += 1
+                    continue
+                if not isinstance(event, dict):
+                    state.malformed_lines += 1
+                    continue
+
+                state.update(event)
+                if state.last_activity:
+                    say(f"{state.status:<9} {state.last_activity}")
+
+                now = time.monotonic()
+                if state.status != prev_status or (now - last_status_write) >= STATUS_WRITE_MIN_INTERVAL:
+                    publish()
+                    last_status_write = now
+                    prev_status = state.status
+
+        try:
+            exit_code = proc.wait(timeout=KILL_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            # 管道已关闭但进程还没收尸，再补一刀
+            terminate_tree(proc)
+            exit_code = proc.wait(timeout=KILL_GRACE_SEC)
+    finally:
+        # 无论正常结束还是中途抛异常，都不能留下活着的子进程或没关的管道
+        watchdog.cancel()
+        if proc.poll() is None:
+            terminate_tree(proc)
+        stderr_thread.join(timeout=5)
+        close_streams(proc)
 
     stderr_text = "".join(stderr_chunks)
     if stderr_text.strip():
